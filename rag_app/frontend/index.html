@@ -1,0 +1,1108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Financial RAG Chatbot — Powered by RuVector</title>
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- FontAwesome for Premium Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <style>
+        /* CSS Variables - Premium HSL Color Palette & Glassmorphic Tokens */
+        :root {
+            --bg-body: #080c14;
+            --bg-card: rgba(17, 25, 40, 0.65);
+            --bg-card-hover: rgba(23, 33, 53, 0.8);
+            --border-glow: rgba(255, 255, 255, 0.08);
+            --border-glow-active: rgba(6, 182, 212, 0.3);
+            
+            --text-primary: #f3f4f6;
+            --text-secondary: #9ca3af;
+            --text-muted: #6b7280;
+            
+            --accent-cyan: #06b6d4;
+            --accent-violet: #8b5cf6;
+            --accent-magenta: #d946ef;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            
+            --glow-cyan: rgba(6, 182, 212, 0.15);
+            --glow-violet: rgba(139, 92, 246, 0.15);
+            
+            --font-display: 'Outfit', 'Inter', sans-serif;
+            --font-body: 'Inter', sans-serif;
+            
+            --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            --shadow-premium: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+        }
+
+        body {
+            background-color: var(--bg-body);
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(at 10% 20%, rgba(6, 182, 212, 0.08) 0px, transparent 50%),
+                radial-gradient(at 90% 80%, rgba(139, 92, 246, 0.08) 0px, transparent 50%);
+        }
+
+        /* Top Navigation Bar */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.25rem 2rem;
+            background: rgba(8, 12, 20, 0.7);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border-glow);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .logo-area {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-area i {
+            font-size: 1.75rem;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            filter: drop-shadow(0 2px 8px rgba(6, 182, 212, 0.3));
+        }
+
+        .logo-area h1 {
+            font-family: var(--font-display);
+            font-weight: 700;
+            font-size: 1.25rem;
+            letter-spacing: 0.05em;
+            background: linear-gradient(135deg, #fff, #a7f3d0);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .system-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.85rem;
+            font-weight: 500;
+            padding: 0.4rem 0.8rem;
+            border-radius: 9999px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-glow);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--accent-red);
+            box-shadow: 0 0 8px var(--accent-red);
+        }
+
+        .status-dot.online {
+            background-color: var(--accent-green);
+            box-shadow: 0 0 8px var(--accent-green);
+            animation: pulse-green 2s infinite;
+        }
+
+        /* Layout Grid */
+        .container {
+            display: grid;
+            grid-template-columns: 320px 1fr;
+            flex: 1;
+            height: calc(100vh - 69px);
+            overflow: hidden;
+        }
+
+        /* Sidebar Styling */
+        .sidebar {
+            background: rgba(10, 15, 26, 0.5);
+            border-right: 1px solid var(--border-glow);
+            padding: 1.5rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            overflow-y: auto;
+        }
+
+        .sidebar-widget {
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
+            border-radius: 16px;
+            padding: 1.25rem;
+            box-shadow: var(--shadow-premium);
+            backdrop-filter: blur(16px);
+            transition: var(--transition-smooth);
+        }
+
+        .sidebar-widget:hover {
+            border-color: rgba(255, 255, 255, 0.12);
+            background: var(--bg-card-hover);
+        }
+
+        .widget-title {
+            font-family: var(--font-display);
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 0.85rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .widget-title i {
+            color: var(--accent-cyan);
+        }
+
+        /* File Upload Area */
+        .upload-zone {
+            border: 2px dashed rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 1.5rem 1rem;
+            text-align: center;
+            cursor: pointer;
+            transition: var(--transition-smooth);
+            background: rgba(255, 255, 255, 0.01);
+            position: relative;
+        }
+
+        .upload-zone:hover {
+            border-color: var(--accent-cyan);
+            background: rgba(6, 182, 212, 0.03);
+        }
+
+        .upload-zone i {
+            font-size: 2rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.75rem;
+            transition: var(--transition-smooth);
+        }
+
+        .upload-zone:hover i {
+            color: var(--accent-cyan);
+            transform: translateY(-3px);
+        }
+
+        .upload-zone p {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.25rem;
+        }
+
+        .upload-zone span {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+        }
+
+        #file-input {
+            display: none;
+        }
+
+        .upload-progress {
+            margin-top: 1rem;
+            display: none;
+        }
+
+        .progress-bar-container {
+            width: 100%;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-top: 0.5rem;
+        }
+
+        .progress-bar {
+            width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-cyan), var(--accent-violet));
+            transition: width 0.3s;
+        }
+
+        /* Collection Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            width: 100%;
+            padding: 0.75rem 1rem;
+            border-radius: 10px;
+            border: 1px solid var(--border-glow);
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text-primary);
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: var(--transition-smooth);
+        }
+
+        .btn:hover {
+            background: rgba(255, 255, 255, 0.08);
+            border-color: rgba(255, 255, 255, 0.2);
+            transform: translateY(-1px);
+        }
+
+        .btn-accent {
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+            border: none;
+            color: #fff;
+            font-weight: 600;
+            box-shadow: 0 4px 14px rgba(6, 182, 212, 0.25);
+        }
+
+        .btn-accent:hover {
+            background: linear-gradient(135deg, #08cbe5, #9d7cff);
+            box-shadow: 0 6px 20px rgba(6, 182, 212, 0.35);
+        }
+
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.08);
+            border-color: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+        }
+
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.4);
+            color: #fff;
+        }
+
+        /* Info list */
+        .info-list {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 0.6rem;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .info-list li {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .info-list li span {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        /* Chat Workspace */
+        .chat-area {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+            position: relative;
+        }
+
+        /* Message Display Scroll */
+        .messages-timeline {
+            flex: 1;
+            overflow-y: auto;
+            padding: 2rem;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            scroll-behavior: smooth;
+        }
+
+        /* Chat Welcome screen */
+        .welcome-hero {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            text-align: center;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .welcome-icon {
+            font-size: 3.5rem;
+            margin-bottom: 1.5rem;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-magenta));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            filter: drop-shadow(0 4px 12px rgba(6, 182, 212, 0.25));
+        }
+
+        .welcome-hero h2 {
+            font-family: var(--font-display);
+            font-size: 2rem;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 0.75rem;
+        }
+
+        .welcome-hero p {
+            color: var(--text-secondary);
+            font-size: 0.95rem;
+            line-height: 1.6;
+            margin-bottom: 2rem;
+        }
+
+        /* Message Bubbles */
+        .message-row {
+            display: flex;
+            width: 100%;
+            gap: 1rem;
+        }
+
+        .message-row.user {
+            justify-content: flex-end;
+        }
+
+        .avatar {
+            width: 38px;
+            height: 38px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1rem;
+            flex-shrink: 0;
+            border: 1px solid var(--border-glow);
+        }
+
+        .message-row.user .avatar {
+            background: rgba(139, 92, 246, 0.15);
+            border-color: rgba(139, 92, 246, 0.3);
+            color: var(--accent-violet);
+        }
+
+        .message-row.bot .avatar {
+            background: rgba(6, 182, 212, 0.15);
+            border-color: rgba(6, 182, 212, 0.3);
+            color: var(--accent-cyan);
+        }
+
+        .bubble {
+            max-width: 75%;
+            padding: 1rem 1.25rem;
+            border-radius: 16px;
+            line-height: 1.6;
+            font-size: 0.92rem;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            word-wrap: break-word;
+        }
+
+        .message-row.user .bubble {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.3), rgba(217, 70, 239, 0.2));
+            border: 1px solid rgba(139, 92, 246, 0.25);
+            color: #fff;
+            border-top-right-radius: 2px;
+        }
+
+        .message-row.bot .bubble {
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
+            color: var(--text-primary);
+            border-top-left-radius: 2px;
+        }
+
+        .bubble p {
+            margin-bottom: 0.75rem;
+        }
+
+        .bubble p:last-child {
+            margin-bottom: 0;
+        }
+
+        /* Citations Accordion in Bubble */
+        .citations-container {
+            margin-top: 1rem;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            padding-top: 0.75rem;
+        }
+
+        .citations-header {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-cyan);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+
+        .citation-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.25rem 0.6rem;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-glow);
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            margin-right: 0.5rem;
+            margin-bottom: 0.4rem;
+            transition: var(--transition-smooth);
+        }
+
+        .citation-tag:hover {
+            background: rgba(6, 182, 212, 0.1);
+            border-color: rgba(6, 182, 212, 0.3);
+            color: #fff;
+        }
+
+        /* Input Controls Panel */
+        .chat-input-wrapper {
+            padding: 1.5rem 2rem 2rem 2rem;
+            background: linear-gradient(180deg, transparent, var(--bg-body) 40%);
+        }
+
+        .chat-input-bar {
+            display: flex;
+            align-items: center;
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
+            border-radius: 16px;
+            padding: 0.5rem 0.75rem 0.5rem 1.25rem;
+            box-shadow: var(--shadow-premium);
+            backdrop-filter: blur(24px);
+            transition: var(--transition-smooth);
+        }
+
+        .chat-input-bar:focus-within {
+            border-color: var(--border-glow-active);
+            box-shadow: 0 0 16px rgba(6, 182, 212, 0.1);
+        }
+
+        .chat-input-bar textarea {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            font-size: 0.95rem;
+            resize: none;
+            height: 36px;
+            line-height: 24px;
+            padding-right: 1rem;
+        }
+
+        .chat-input-bar textarea::placeholder {
+            color: var(--text-muted);
+        }
+
+        .send-circle {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-violet));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            border: none;
+            cursor: pointer;
+            transition: var(--transition-smooth);
+        }
+
+        .send-circle:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 12px rgba(6, 182, 212, 0.4);
+        }
+
+        .send-circle:active {
+            transform: scale(0.95);
+        }
+
+        /* Citation Slide-over Panel (For highly analytical exploration) */
+        .citation-drawer {
+            position: fixed;
+            top: 69px;
+            right: -450px;
+            width: 420px;
+            height: calc(100vh - 69px);
+            background: rgba(10, 16, 26, 0.85);
+            backdrop-filter: blur(20px);
+            border-left: 1px solid var(--border-glow);
+            box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5);
+            z-index: 90;
+            transition: right 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            padding: 2rem;
+            overflow-y: auto;
+        }
+
+        .citation-drawer.open {
+            right: 0;
+        }
+
+        .drawer-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+            padding-bottom: 0.75rem;
+        }
+
+        .drawer-header h3 {
+            font-family: var(--font-display);
+            font-size: 1.15rem;
+            font-weight: 600;
+            color: #fff;
+        }
+
+        .close-drawer {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: var(--transition-smooth);
+        }
+
+        .close-drawer:hover {
+            color: #fff;
+        }
+
+        .drawer-meta {
+            font-size: 0.8rem;
+            background: rgba(6, 182, 212, 0.05);
+            border: 1px solid rgba(6, 182, 212, 0.15);
+            padding: 0.5rem 0.75rem;
+            border-radius: 8px;
+            color: var(--accent-cyan);
+            margin-bottom: 1.25rem;
+            font-weight: 500;
+        }
+
+        .drawer-text {
+            font-size: 0.88rem;
+            line-height: 1.6;
+            color: var(--text-secondary);
+            background: rgba(255, 255, 255, 0.02);
+            padding: 1.25rem;
+            border-radius: 12px;
+            border: 1px solid var(--border-glow);
+            white-space: pre-wrap;
+            font-family: 'Courier New', Courier, monospace; /* Perfect for table structures */
+        }
+
+        /* Animations */
+        @keyframes pulse-green {
+            0% {
+                box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4);
+            }
+            70% {
+                box-shadow: 0 0 0 10px rgba(16, 185, 129, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
+            }
+        }
+
+        /* Table Rendering inside chat */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.85rem;
+        }
+
+        table th, table td {
+            padding: 0.5rem 0.75rem;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            text-align: left;
+        }
+
+        table th {
+            background-color: rgba(255, 255, 255, 0.03);
+            color: #fff;
+            font-weight: 600;
+        }
+
+        table tr:nth-child(even) {
+            background-color: rgba(255, 255, 255, 0.01);
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header -->
+    <header>
+        <div class="logo-area">
+            <i class="fa-solid fa-brain-circuit"></i>
+            <h1>COGNITIVE FINANCE RAG</h1>
+        </div>
+        <div class="system-status">
+            <div id="status-dot" class="status-dot"></div>
+            <span id="status-text">VectorDB Offline</span>
+        </div>
+    </header>
+
+    <!-- App Container -->
+    <div class="container">
+        <!-- Left Sidebar: Controls & Ingestion -->
+        <aside class="sidebar">
+            
+            <!-- Ingest Box -->
+            <div class="sidebar-widget">
+                <div class="widget-title">
+                    <i class="fa-solid fa-cloud-arrow-up"></i>
+                    <h2>Ingest Financial Docs</h2>
+                </div>
+                <div class="upload-zone" onclick="document.getElementById('file-input').click()">
+                    <i class="fa-solid fa-file-invoice-dollar"></i>
+                    <p>Click to Upload Document</p>
+                    <span>PDF, CSV, Excel, or TXT</span>
+                    <input type="file" id="file-input" accept=".pdf,.csv,.xlsx,.xls,.txt">
+                </div>
+                
+                <div class="upload-progress" id="upload-progress">
+                    <span style="font-size: 0.75rem; color: var(--text-secondary);" id="upload-status-label">Ingesting...</span>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progress-indicator"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Vector Database Specs -->
+            <div class="sidebar-widget">
+                <div class="widget-title">
+                    <i class="fa-solid fa-server"></i>
+                    <h2>RuVector VectorDB</h2>
+                </div>
+                <ul class="info-list">
+                    <li>Database engine: <span>Rust HNSW</span></li>
+                    <li>REST Server URL: <span style="font-size: 0.75rem;">http://ruvector:6333</span></li>
+                    <li>Status: <span id="db-status-badge" style="color: var(--accent-red); font-weight: bold;">Offline</span></li>
+                    <li>Index Type: <span>Cosine HNSW</span></li>
+                </ul>
+            </div>
+
+            <!-- Ingestion stats / Reset button -->
+            <div class="sidebar-widget" style="margin-top: auto;">
+                <div class="widget-title">
+                    <i class="fa-solid fa-gears"></i>
+                    <h2>System Control</h2>
+                </div>
+                <button class="btn btn-danger" onclick="clearCollection()">
+                    <i class="fa-solid fa-trash-can"></i>
+                    Reset Database
+                </button>
+            </div>
+
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main class="chat-area">
+            
+            <!-- Chat Timeline -->
+            <div class="messages-timeline" id="chat-timeline">
+                <!-- Welcome Screen -->
+                <div class="welcome-hero" id="welcome-screen">
+                    <div class="welcome-icon">
+                        <i class="fa-solid fa-comments-dollar"></i>
+                    </div>
+                    <h2>Cost-Efficient Financial RAG</h2>
+                    <p>
+                        A smarter, faster, and highly accurate financial query system. Upload balance sheets, income statements, or financial prospectuses, and extract precision data backed by <strong>RuVector HNSW</strong> and local cross-encoder re-ranking.
+                    </p>
+                    <div style="width: 100%; display: flex; justify-content: center; gap: 1rem;">
+                        <button class="btn" style="max-width: 200px;" onclick="document.getElementById('file-input').click()">
+                            <i class="fa-solid fa-file-arrow-up"></i> Ingest Document
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Chat Input Bar -->
+            <div class="chat-input-wrapper">
+                <div class="chat-input-bar">
+                    <textarea id="user-input" placeholder="Ask a financial question (e.g. What is the net revenue for FY24?)..." onkeydown="handleKeyDown(event)"></textarea>
+                    <button class="send-circle" onclick="sendChat()" id="send-button">
+                        <i class="fa-solid fa-paper-plane"></i>
+                    </button>
+                </div>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- Slide-over Citation Drawer -->
+    <div class="citation-drawer" id="citation-drawer">
+        <div class="drawer-header">
+            <h3>Verified Source Extract</h3>
+            <i class="fa-solid fa-xmark close-drawer" onclick="toggleDrawer(false)"></i>
+        </div>
+        <div class="drawer-meta" id="drawer-source-meta">
+            Source: FY2024_Report.pdf
+        </div>
+        <div class="drawer-text" id="drawer-text-content">
+            Balance sheet row data...
+        </div>
+    </div>
+
+    <!-- JS Logic -->
+    <script>
+        const API_BASE = window.location.origin; // Same-host unified deployment
+        let isProcessing = false;
+
+        // On Load: Health check VectorDB & Init UI
+        window.addEventListener('DOMContentLoaded', () => {
+            checkDatabaseHealth();
+            // Perform health check every 10 seconds
+            setInterval(checkDatabaseHealth, 10000);
+            
+            // Set up file input trigger
+            document.getElementById('file-input').addEventListener('change', uploadFile);
+        });
+
+        // Health Check
+        async function checkDatabaseHealth() {
+            try {
+                const response = await fetch(`${API_BASE}/collections`);
+                if (response.ok) {
+                    setOnlineState(true);
+                } else {
+                    setOnlineState(false);
+                }
+            } catch (error) {
+                console.error("Health check error:", error);
+                setOnlineState(false);
+            }
+        }
+
+        function setOnlineState(isOnline) {
+            const statusDot = document.getElementById('status-dot');
+            const statusText = document.getElementById('status-text');
+            const dbBadge = document.getElementById('db-status-badge');
+            
+            if (isOnline) {
+                statusDot.classList.add('online');
+                statusText.innerText = "VectorDB Online";
+                dbBadge.innerText = "Active";
+                dbBadge.style.color = "var(--accent-green)";
+            } else {
+                statusDot.classList.remove('online');
+                statusText.innerText = "VectorDB Offline";
+                dbBadge.innerText = "Offline";
+                dbBadge.style.color = "var(--accent-red)";
+            }
+        }
+
+        // Handle File Upload & Ingestion
+        async function uploadFile(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const progressZone = document.getElementById('upload-progress');
+            const statusLabel = document.getElementById('upload-status-label');
+            const indicator = document.getElementById('progress-indicator');
+            
+            progressZone.style.display = 'block';
+            statusLabel.innerText = `Reading '${file.name}'...`;
+            indicator.style.width = '20%';
+
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('collection', 'finance_docs');
+
+            try {
+                indicator.style.width = '50%';
+                statusLabel.innerText = "Chunking & generating embeddings...";
+                
+                const response = await fetch(`${API_BASE}/ingest`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+                    indicator.style.width = '100%';
+                    statusLabel.innerText = `Loaded ${result.chunks} chunks successfully!`;
+                    
+                    // Add message in chat timeline about successful ingestion
+                    addSystemMessage(`Successfully ingested document **${result.filename}** (${result.chunks} chunks loaded to RuVector HNSW in ${result.elapsed_seconds}s). You can now ask questions about it!`);
+                    
+                    setTimeout(() => {
+                        progressZone.style.display = 'none';
+                        indicator.style.width = '0%';
+                    }, 4000);
+                } else {
+                    const err = await response.json();
+                    throw new Error(err.detail || "Ingestion failed");
+                }
+            } catch (error) {
+                console.error("Upload error:", error);
+                statusLabel.innerText = `Ingestion error: ${error.message}`;
+                indicator.style.backgroundColor = 'var(--accent-red)';
+                setTimeout(() => {
+                    progressZone.style.display = 'none';
+                    indicator.style.backgroundColor = 'var(--accent-cyan)';
+                }, 6000);
+            }
+        }
+
+        // Chat logic
+        function handleKeyDown(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendChat();
+            }
+        }
+
+        async function sendChat() {
+            const inputField = document.getElementById('user-input');
+            const queryText = inputField.value.trim();
+            if (!queryText || isProcessing) return;
+
+            // Remove welcome screen if visible
+            const welcome = document.getElementById('welcome-screen');
+            if (welcome) welcome.remove();
+
+            // Append User message
+            appendMessage(queryText, 'user');
+            inputField.value = '';
+            
+            // Set Loading state
+            isProcessing = true;
+            const botMessageId = appendMessage('<i class="fa-solid fa-circle-notch fa-spin"></i> Processing financial extracts and reranking...', 'bot', true);
+            
+            try {
+                const response = await fetch(`${API_BASE}/chat`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: jsonStr = JSON.stringify({
+                        message: queryText,
+                        collection: 'finance_docs'
+                    })
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+                    updateBotMessage(botMessageId, result.response, result.citations);
+                } else {
+                    const err = await response.json();
+                    updateBotMessage(botMessageId, `Error processing request: ${err.detail || "Server error"}`);
+                }
+            } catch (error) {
+                console.error("Chat error:", error);
+                updateBotMessage(botMessageId, `Error communicating with FastAPI server. Please check if backend is running. Details: ${error.message}`);
+            } finally {
+                isProcessing = false;
+            }
+        }
+
+        let messageCounter = 0;
+
+        function appendMessage(text, sender, isRawHtml = false) {
+            messageCounter++;
+            const id = `msg-${messageCounter}`;
+            const timeline = document.getElementById('chat-timeline');
+            
+            const row = document.createElement('div');
+            row.className = `message-row ${sender}`;
+            row.id = id;
+            
+            const avatar = document.createElement('div');
+            avatar.className = 'avatar';
+            avatar.innerHTML = sender === 'user' ? '<i class="fa-solid fa-user-tie"></i>' : '<i class="fa-solid fa-brain"></i>';
+            
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            
+            if (isRawHtml) {
+                bubble.innerHTML = text;
+            } else {
+                bubble.innerHTML = parseMarkdown(text);
+            }
+            
+            if (sender === 'user') {
+                row.appendChild(bubble);
+                row.appendChild(avatar);
+            } else {
+                row.appendChild(avatar);
+                row.appendChild(bubble);
+            }
+            
+            timeline.appendChild(row);
+            timeline.scrollTop = timeline.scrollHeight;
+            return id;
+        }
+
+        function addSystemMessage(text) {
+            const timeline = document.getElementById('chat-timeline');
+            const sysBox = document.createElement('div');
+            sysBox.style.margin = '1rem 0';
+            sysBox.style.padding = '0.75rem 1rem';
+            sysBox.style.background = 'rgba(6, 182, 212, 0.03)';
+            sysBox.style.border = '1px solid rgba(6, 182, 212, 0.15)';
+            sysBox.style.borderRadius = '10px';
+            sysBox.style.color = 'var(--text-secondary)';
+            sysBox.style.fontSize = '0.85rem';
+            sysBox.style.textAlign = 'center';
+            sysBox.innerHTML = `<i class="fa-solid fa-circle-info" style="color: var(--accent-cyan); margin-right: 0.5rem;"></i> ${parseMarkdown(text)}`;
+            
+            // Remove welcome screen if visible
+            const welcome = document.getElementById('welcome-screen');
+            if (welcome) welcome.remove();
+            
+            timeline.appendChild(sysBox);
+            timeline.scrollTop = timeline.scrollHeight;
+        }
+
+        function updateBotMessage(messageId, text, citations = []) {
+            const messageRow = document.getElementById(messageId);
+            if (!messageRow) return;
+            
+            const bubble = messageRow.querySelector('.bubble');
+            bubble.innerHTML = parseMarkdown(text);
+            
+            if (citations && citations.length > 0) {
+                const citeContainer = document.createElement('div');
+                citeContainer.className = 'citations-container';
+                
+                const header = document.createElement('div');
+                header.className = 'citations-header';
+                header.innerHTML = '<i class="fa-solid fa-square-check"></i> Grounded Citations';
+                citeContainer.appendChild(header);
+                
+                citations.forEach((c, idx) => {
+                    const tag = document.createElement('div');
+                    tag.className = 'citation-tag';
+                    tag.innerHTML = `<i class="fa-solid fa-file-text"></i> [${idx + 1}] ${c.source.split('/').pop()}`;
+                    tag.onclick = () => showCitationDetails(c);
+                    citeContainer.appendChild(tag);
+                });
+                
+                bubble.appendChild(citeContainer);
+            }
+            
+            const timeline = document.getElementById('chat-timeline');
+            timeline.scrollTop = timeline.scrollHeight;
+        }
+
+        // Citation Drawer Exploration
+        function showCitationDetails(citation) {
+            document.getElementById('drawer-source-meta').innerText = `Source Document: ${citation.source} (${citation.type})`;
+            document.getElementById('drawer-text-content').innerText = citation.snippet;
+            toggleDrawer(true);
+        }
+
+        function toggleDrawer(isOpen) {
+            const drawer = document.getElementById('citation-drawer');
+            if (isOpen) {
+                drawer.classList.add('open');
+            } else {
+                drawer.classList.remove('open');
+            }
+        }
+
+        // Reset database
+        async function clearCollection() {
+            if (!confirm("Are you sure you want to clear the entire financial database? All document chunks and HNSW indexes will be wiped.")) return;
+            
+            try {
+                const formData = new FormData();
+                formData.append('collection', 'finance_docs');
+                
+                const response = await fetch(`${API_BASE}/collections/clear`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (response.ok) {
+                    addSystemMessage("Financial database collections successfully cleared and reset.");
+                } else {
+                    alert("Failed to clear database.");
+                }
+            } catch (error) {
+                console.error("Clear error:", error);
+                alert(`Error: ${error.message}`);
+            }
+        }
+
+        // Minimalist parser for Markdown tables and lists in chatbot bubble
+        function parseMarkdown(text) {
+            if (!text) return "";
+            
+            // Clean HTML tags first for XSS safety
+            let clean = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            
+            // Bold
+            clean = clean.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            
+            // Inline Code
+            clean = clean.replace(/`(.*?)`/g, '<code>$1</code>');
+            
+            // Bullets
+            clean = clean.replace(/^\s*[-*]\s+(.*)$/gm, '<li>$1</li>');
+            clean = clean.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
+            
+            // Markdown tables (detect pipe structure)
+            const lines = clean.split('\n');
+            let inTable = false;
+            let tableHtml = '<table>';
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                
+                if (line.startsWith('|') && line.endsWith('|')) {
+                    const cells = line.split('|').map(c => c.trim()).filter((_, idx, arr) => idx > 0 && idx < arr.length - 1);
+                    
+                    if (!inTable) {
+                        inTable = true;
+                        tableHtml += '<thead><tr>';
+                        cells.forEach(c => { tableHtml += `<th>${c}</th>`; });
+                        tableHtml += '</tr></thead><tbody>';
+                    } else {
+                        // Check if separator row
+                        if (line.includes('---')) {
+                            continue;
+                        }
+                        tableHtml += '<tr>';
+                        cells.forEach(c => { tableHtml += `<td>${c}</td>`; });
+                        tableHtml += '</tr>';
+                    }
+                    lines[i] = ""; // Clear line so it isn't rendered separately
+                } else {
+                    if (inTable) {
+                        inTable = false;
+                        tableHtml += '</tbody></table>';
+                        lines[i] = tableHtml + '\n' + lines[i];
+                        tableHtml = '<table>';
+                    }
+                }
+            }
+            
+            // Reassemble lines
+            const processed = lines.filter(l => l !== "").join('\n');
+            
+            // Newlines to br
+            return processed.replace(/\n/g, '<br>');
+        }
+    </script>
+</body>
+</html>

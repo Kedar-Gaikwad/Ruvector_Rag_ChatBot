@@ -1,0 +1,41 @@
+services:
+
+  ruvector-db:
+    image: ruvnet/ruvector:latest
+    container_name: ruvector-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    volumes:
+      - ruvector_data:/var/lib/postgresql/data
+
+  rag-chatbot:
+    build:
+      context: /home/ubuntu/rag_app
+      dockerfile: Dockerfile
+    container_name: rag-chatbot
+    restart: unless-stopped
+    ports:
+      - "80:8000"
+    environment:
+      # RuVector REST Server running on EC2 host
+      - RUVECTOR_URL=http://172.17.0.1:6333
+
+      # Embeddings
+      - EMBEDDING_PROVIDER=bedrock
+
+      # LLM
+      - LLM_PROVIDER=bedrock
+
+      # AWS
+      - AWS_REGION=us-east-1
+
+      # Optional if not using IAM Role
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+
+    depends_on:
+      - ruvector-db
+
+volumes:
+  ruvector_data:
