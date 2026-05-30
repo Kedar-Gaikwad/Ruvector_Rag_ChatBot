@@ -290,10 +290,13 @@ async def health_check():
 
     # Check Bedrock connectivity — invoke a minimal Titan embedding as a real end-to-end probe
     bedrock_status = "unknown"
-    if bedrock_client:
+    if bedrock_runtime_client:  # <--- CHANGED THIS to bedrock_runtime_client
         try:
-            body = json.dumps({"inputText": "health"})
-            resp = bedrock_client.invoke_model(
+            body = json.dumps({
+                "inputText": "health",
+                "dimensions": 1024  # Added dimensions just to be safe with Titan v2
+            })
+            resp = bedrock_runtime_client.invoke_model(  # <--- CHANGED THIS to bedrock_runtime_client
                 body=body,
                 modelId="amazon.titan-embed-text-v2:0",
                 accept="application/json",
