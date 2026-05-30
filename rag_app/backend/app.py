@@ -69,10 +69,11 @@ logger.info(f"RUVECTOR_URL={RUVECTOR_URL}, EMBEDDING_PROVIDER={EMBEDDING_PROVIDE
 # AWS BEDROCK CLIENT - Uses IAM instance role (no hardcoded credentials)
 # ============================================================================
 bedrock_client = None
+bedrock_runtime_client = None  # ADDED for invoking models
 
 def init_bedrock_client():
     """Initialize Bedrock client using IAM role credentials from instance metadata."""
-    global bedrock_client
+    global bedrock_client, bedrock_runtime_client
     try:
         boto_config = BotoConfig(
             region_name=AWS_REGION,
@@ -80,13 +81,19 @@ def init_bedrock_client():
             connect_timeout=5,
             retries={'max_attempts': 3, 'mode': 'adaptive'}
         )
+        # Control plane (used for health checks)
         bedrock_client = boto3.client(
+            service_name="bedrock",
+            config=boto_config
+        )
+        # Data plane (REQUIRED for model invocation)
+        bedrock_runtime_client = boto3.client(
             service_name="bedrock-runtime",
             config=boto_config
         )
-        logger.info("AWS Bedrock client initialized via IAM role", extra={'request_id': 'startup'})
+        logger.info("AWS Bedrock clients initialized via IAM role", extra={'request_id': 'startup'})
     except Exception as e:
-        logger.warning(f"Failed to initialize Bedrock client: {e}", extra={'request_id': 'startup'})
+        logger.warning(f"Failed to initialize Bedrock clients: {e}", extra={'request_id': 'startup'})
 
 init_bedrock_client()
 
@@ -102,12 +109,16 @@ ingestion_jobs: Dict[str, Dict[str, Any]] = {}  # job_id -> status dict
 
 def get_embedding(text: str) -> List[float]:
     """Generate embeddings using AWS Bedrock Titan Embed v2 (1024 dimensions)."""
-    if EMBEDDING_PROVIDER != "bedrock" or not bedrock_client:
+    if EMBEDDING_PROVIDER != "bedrock" or not bedrock_runtime_client:
         raise RuntimeError("No embedding provider available. EMBEDDING_PROVIDER=bedrock required with valid IAM role.")
 
     try:
-        body = json.dumps({"inputText": text})
-        response = bedrock_client.invoke_model(
+        # Explicitly declare dimensions for Titan v2
+        body = json.dumps({
+            "inputText": text,
+            "dimensions": 1024
+        })
+        response = bedrock_runtime_client.invoke_model(
             body=body,
             modelId="amazon.titan-embed-text-v2:0",
             accept="application/json",
@@ -213,8 +224,8 @@ def run_output_guardrail(response: str, contexts: List[str]) -> str:
 # ============================================================================
 
 def call_bedrock_haiku(query: str, contexts: List[str]) -> str:
-    """Calls Claude 3.5 Haiku via AWS Bedrock for RAG generation."""
-    if not bedrock_client:
+    """Calls Claude via AWS Bedrock for RAG generation."""
+    if not bedrock_runtime_client:
         return "AWS Bedrock client is not initialized. Verify IAM role credentials."
 
     context_str = "\n\n---\n\n".join(contexts)
@@ -237,9 +248,10 @@ def call_bedrock_haiku(query: str, contexts: List[str]) -> str:
             "temperature": 0.1
         })
 
-        response = bedrock_client.invoke_model(
+        response = bedrock_runtime_client.invoke_model(
             body=body,
-            modelId="anthropic.claude-3-5-haiku-20241022-v1:0",
+            # Updated to the requested US Cross-Region Inference Profile
+            modelId="us.anthropic.claude-haiku-4-5-20251001-v1:0",
             accept="application/json",
             contentType="application/json"
         )
@@ -248,7 +260,6 @@ def call_bedrock_haiku(query: str, contexts: List[str]) -> str:
     except Exception as e:
         logger.error(f"Bedrock LLM invocation failed: {e}", extra={'request_id': 'llm'})
         return f"Bedrock error: {e}"
-
 
 # ============================================================================
 # MODELS
