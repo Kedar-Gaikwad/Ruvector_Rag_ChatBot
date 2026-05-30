@@ -41,39 +41,23 @@ systemctl start docker
 echo "Docker installed successfully"
 
 # --------------------------------------------------
-# Install CloudWatch Logs Agent
+# Configure Docker to use awslogs driver by default
 # --------------------------------------------------
-curl -sO https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
-dpkg -i -E ./amazon-cloudwatch-agent.deb
+REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
 
-cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWCONFIG'
+cat > /etc/docker/daemon.json <<EOF
 {
-  "logs": {
-    "logs_collected": {
-      "files": {
-        "collect_list": [
-          {
-            "file_path": "/var/log/rag-app/*.log",
-            "log_group_name": "${log_group}",
-            "log_stream_name": "{instance_id}/rag-app",
-            "timestamp_format": "%Y-%m-%dT%H:%M:%S"
-          },
-          {
-            "file_path": "/var/log/user-data.log",
-            "log_group_name": "${log_group}",
-            "log_stream_name": "{instance_id}/user-data",
-            "timestamp_format": "%Y-%m-%dT%H:%M:%S"
-          }
-        ]
-      }
-    }
+  "log-driver": "awslogs",
+  "log-opts": {
+    "awslogs-region": "$REGION",
+    "awslogs-group": "${log_group}",
+    "tag": "rag-app/{{.Name}}/{{.ID}}"
   }
 }
-CWCONFIG
+EOF
 
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-  -a fetch-config -m ec2 \
-  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+systemctl restart docker
+echo "Docker configured with awslogs driver"
 
 # --------------------------------------------------
 # Clone and build RAG App
@@ -87,8 +71,6 @@ chown -R ubuntu:ubuntu /home/ubuntu/rag_app
 # --------------------------------------------------
 # Build and run RAG App container
 # --------------------------------------------------
-mkdir -p /var/log/rag-app
-
 cd /home/ubuntu/rag_app
 
 docker build -t rag-chatbot -f Dockerfile .
@@ -97,7 +79,7 @@ docker run -d \
   --name rag-chatbot \
   --restart unless-stopped \
   -p 8000:8000 \
-  -v /var/log/rag-app:/var/log/rag-app \
+  --log-opt awslogs-stream="rag-chatbot" \
   -e RUVECTOR_URL="${ruvector_url}" \
   -e EMBEDDING_PROVIDER="${embedding_provider}" \
   -e LLM_PROVIDER="${llm_provider}" \

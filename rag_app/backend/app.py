@@ -391,56 +391,61 @@ async def ingest_document(file: UploadFile = File(...), collection: str = Form("
 
         # Create collection in RuVector
         dim = get_vector_dimension()
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             try:
                 await client.post(f"{RUVECTOR_URL}/collections", json={
                     "name": collection, "dimension": dim, "metric": "Cosine"
-                }, timeout=5.0)
+                })
             except Exception as e:
                 logger.warning(f"Could not create collection: {e}", extra={'request_id': request_id})
 
-        # Generate embeddings and upload vectors
-        vector_entries = []
+        # Generate embeddings and upload vectors IN BATCHES
+        # Process 10 chunks at a time to avoid OOM and keep health checks responsive
+        BATCH_SIZE = 10
         total_chunks = len(chunks)
-        for idx, chunk in enumerate(chunks):
-            try:
-                vector = get_embedding(chunk["text"])
-                meta = chunk["metadata"]
-                meta["text"] = chunk["text"]
-                vector_entries.append({
-                    "id": f"{filename}_{idx}_{int(time.time())}",
-                    "vector": vector,
-                    "metadata": meta
-                })
-            except Exception as e:
-                logger.error(f"Embedding chunk {idx} failed: {e}", extra={'request_id': request_id})
+        inserted_count = 0
+
+        for batch_start in range(0, total_chunks, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_chunks)
+            batch_chunks = chunks[batch_start:batch_end]
+            batch_vectors = []
+
+            for idx, chunk in enumerate(batch_chunks):
+                try:
+                    vector = get_embedding(chunk["text"])
+                    meta = chunk["metadata"]
+                    meta["text"] = chunk["text"]
+                    batch_vectors.append({
+                        "id": f"{filename}_{batch_start + idx}_{int(time.time())}",
+                        "vector": vector,
+                        "metadata": meta
+                    })
+                except Exception as e:
+                    logger.error(f"Embedding chunk {batch_start + idx} failed: {e}", extra={'request_id': request_id})
+
+                # Yield to event loop so health checks can respond
+                await asyncio.sleep(0)
+
+            # Upsert this batch immediately (don't accumulate all in memory)
+            if batch_vectors:
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        url = f"{RUVECTOR_URL}/collections/{collection}/points"
+                        response = await client.put(url, json={"points": batch_vectors})
+                        if response.status_code == 200:
+                            inserted_count += len(batch_vectors)
+                        else:
+                            logger.error(f"RuVector batch upsert failed: {response.text}", extra={'request_id': request_id})
+                except Exception as e:
+                    logger.error(f"RuVector batch upsert error: {e}", extra={'request_id': request_id})
 
             # Update progress (60-95% range)
-            ingestion_jobs[job_id]["progress_pct"] = 60 + int((idx + 1) / total_chunks * 35)
-            ingestion_jobs[job_id]["chunks_created"] = len(vector_entries)
+            progress = 60 + int((batch_end / total_chunks) * 35)
+            ingestion_jobs[job_id]["progress_pct"] = progress
+            ingestion_jobs[job_id]["chunks_created"] = inserted_count
 
-        # Upsert to RuVector
-        inserted_count = 0
-        if vector_entries:
-            try:
-                async with httpx.AsyncClient() as client:
-                    url = f"{RUVECTOR_URL}/collections/{collection}/points"
-                    response = await client.put(url, json={"points": vector_entries}, timeout=30.0)
-                    if response.status_code == 200:
-                        inserted_count = len(vector_entries)
-                        logger.info(f"Upserted {inserted_count} vectors", extra={'request_id': request_id})
-                    else:
-                        # Rollback: remove partial vectors on failure
-                        logger.error(f"RuVector upsert failed: {response.text}", extra={'request_id': request_id})
-                        ingestion_jobs[job_id]["status"] = "failed"
-                        ingestion_jobs[job_id]["error"] = f"Vector storage failed: {response.text}"
-                        raise HTTPException(status_code=500, detail=f"RuVector error: {response.text}")
-            except HTTPException:
-                raise
-            except Exception as e:
-                ingestion_jobs[job_id]["status"] = "failed"
-                ingestion_jobs[job_id]["error"] = str(e)
-                raise HTTPException(status_code=503, detail=f"RuVector unavailable: {e}")
+            # Brief pause between batches to prevent overloading
+            await asyncio.sleep(0.1)
 
         # Success
         ingestion_jobs[job_id]["status"] = "completed"
@@ -648,4 +653,3 @@ if os.path.exists(frontend_dir):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
-
