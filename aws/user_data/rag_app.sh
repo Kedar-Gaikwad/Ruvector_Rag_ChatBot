@@ -45,7 +45,7 @@ echo "Docker installed successfully"
 # Wait for Qdrant to be ready (best-effort, non-blocking).
 # ruvector_url is injected by Terraform as http://IP:6333
 # --------------------------------------------------
-QDRANT_HEALTH_URL="${ruvector_url}/health"
+QDRANT_HEALTH_URL="${ruvector_url}/healthz"
 echo "Waiting for Qdrant at $QDRANT_HEALTH_URL ..."
 
 QDRANT_READY=false

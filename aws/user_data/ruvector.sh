@@ -98,11 +98,11 @@ docker run -d \
 echo "Qdrant container started, waiting for it to be ready..."
 sleep 10
 
-# Health check
+# Health check — Qdrant liveness probe is /healthz
 for i in $(seq 1 18); do
-  if curl -sf http://localhost:6333/health > /dev/null 2>&1; then
+  if curl -sf http://localhost:6333/healthz > /dev/null 2>&1; then
     echo "Qdrant is healthy and ready on port 6333!"
-    curl -s http://localhost:6333/health
+    curl -s http://localhost:6333/healthz
     break
   fi
   echo "Waiting for Qdrant... attempt $i/18"

@@ -278,21 +278,30 @@ class ChatQuery(BaseModel):
 async def health_check():
     """Health check for ALB. Always returns 200 — reports component status in body."""
     # Check Qdrant connectivity
+    # Qdrant health endpoint is GET / (returns 200 with version JSON)
+    # /healthz is the Kubernetes liveness probe path
     qdrant_status = "unknown"
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{RUVECTOR_URL}/health", timeout=3.0)
+            resp = await client.get(f"{RUVECTOR_URL}/healthz", timeout=3.0)
             qdrant_status = "healthy" if resp.status_code == 200 else f"unhealthy:{resp.status_code}"
     except Exception as e:
         qdrant_status = f"unavailable:{str(e)[:60]}"
 
-    # Check Bedrock connectivity (lightweight: just verify credentials resolve)
+    # Check Bedrock connectivity — invoke a minimal Titan embedding as a real end-to-end probe
     bedrock_status = "unknown"
     if bedrock_client:
         try:
-            # list_foundation_models is a cheap read-only call to verify auth
-            bedrock_client.list_foundation_models(byOutputModality="TEXT")
-            bedrock_status = "healthy"
+            body = json.dumps({"inputText": "health"})
+            resp = bedrock_client.invoke_model(
+                body=body,
+                modelId="amazon.titan-embed-text-v2:0",
+                accept="application/json",
+                contentType="application/json"
+            )
+            result = json.loads(resp["body"].read())
+            dim = len(result.get("embedding", []))
+            bedrock_status = f"healthy (dim={dim})"
         except Exception as e:
             bedrock_status = f"error:{str(e)[:80]}"
     else:
