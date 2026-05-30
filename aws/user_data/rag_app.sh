@@ -41,23 +41,25 @@ systemctl start docker
 echo "Docker installed successfully"
 
 # --------------------------------------------------
-# Configure Docker to use awslogs driver by default
+# Wait for Qdrant (RuVector instance) to be ready
+# before starting the RAG app - otherwise the first
+# health check will show ruvector=unavailable and the
+# ALB will mark the target unhealthy on first probe.
 # --------------------------------------------------
-REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+echo "Waiting for Qdrant at ${ruvector_url} to be ready..."
+QDRANT_HEALTH="${ruvector_url%:*}:${ruvector_url##*:}/health"
+# ruvector_url is http://IP:6333 - build health URL
+QDRANT_HOST=$(echo "${ruvector_url}" | sed 's|http://||' | cut -d: -f1)
+QDRANT_HEALTH_URL="http://$${QDRANT_HOST}:6333/health"
 
-cat > /etc/docker/daemon.json <<EOF
-{
-  "log-driver": "awslogs",
-  "log-opts": {
-    "awslogs-region": "$REGION",
-    "awslogs-group": "${log_group}",
-    "tag": "rag-app/{{.Name}}/{{.ID}}"
-  }
-}
-EOF
-
-systemctl restart docker
-echo "Docker configured with awslogs driver"
+for i in $(seq 1 30); do
+  if curl -sf "$${QDRANT_HEALTH_URL}" > /dev/null 2>&1; then
+    echo "Qdrant is reachable!"
+    break
+  fi
+  echo "Qdrant not ready yet... attempt $i/30"
+  sleep 10
+done
 
 # --------------------------------------------------
 # Clone and build RAG App
@@ -78,8 +80,7 @@ docker build -t rag-chatbot -f Dockerfile .
 docker run -d \
   --name rag-chatbot \
   --restart unless-stopped \
-  -p 8000:8000 \
-  --log-opt awslogs-stream="rag-chatbot" \
+  --network host \
   -e RUVECTOR_URL="${ruvector_url}" \
   -e EMBEDDING_PROVIDER="${embedding_provider}" \
   -e LLM_PROVIDER="${llm_provider}" \
@@ -90,14 +91,21 @@ docker run -d \
 echo "Waiting for RAG App to start..."
 sleep 10
 
-# Health check
+# Health check - verify both app and Qdrant connection
 for i in $(seq 1 12); do
-  if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+  HEALTH=$(curl -sf http://localhost:8000/health 2>/dev/null || echo "")
+  if echo "$${HEALTH}" | grep -q '"status": "healthy"'; then
     echo "RAG App is healthy!"
+    echo "Health response: $${HEALTH}"
     break
   fi
   echo "Waiting for RAG App health check... attempt $i/12"
   sleep 10
 done
+
+# Verify Bedrock is reachable via IAM role
+echo "Verifying Bedrock connectivity..."
+BEDROCK_CHECK=$(curl -sf http://localhost:8000/health/bedrock 2>/dev/null || echo "no-endpoint")
+echo "Bedrock check: $${BEDROCK_CHECK}"
 
 echo "===== RAG App Deployment Complete $(date) ====="

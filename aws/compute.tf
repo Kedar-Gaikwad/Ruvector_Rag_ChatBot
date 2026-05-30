@@ -19,7 +19,8 @@ data "aws_ami" "ubuntu" {
 }
 
 # --- RAG App EC2 Instance (Spot) ---
-# Placed in public subnet for internet access (git clone, docker pull)
+# Public subnet with public IP so user_data can git clone and docker pull from internet.
+# Security group restricts inbound to ALB:8000 and admin SSH only.
 resource "aws_spot_instance_request" "rag_app" {
   ami                            = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu.id
   instance_type                  = var.rag_app_instance_type
@@ -30,6 +31,7 @@ resource "aws_spot_instance_request" "rag_app" {
   spot_type                      = "persistent"
   instance_interruption_behavior = "stop"
   wait_for_fulfillment           = true
+  key_name                       = var.key_pair_name != "" ? var.key_pair_name : null
 
   root_block_device {
     volume_size           = 20
@@ -42,7 +44,6 @@ resource "aws_spot_instance_request" "rag_app" {
     embedding_provider = var.embedding_provider
     llm_provider       = var.llm_provider
     aws_region         = var.aws_region
-    log_group          = aws_cloudwatch_log_group.rag_app.name
   }))
 
   tags = {
@@ -51,7 +52,8 @@ resource "aws_spot_instance_request" "rag_app" {
 }
 
 # --- RuVector EC2 Instance (On-Demand for data persistence) ---
-# Placed in public subnet for internet access (docker pull ruvnet/ruvector)
+# Public subnet with public IP so user_data can docker pull qdrant from internet.
+# Security group restricts inbound to RAG App SG:6333 and admin SSH only.
 resource "aws_instance" "ruvector" {
   ami                         = var.ami_id != "" ? var.ami_id : data.aws_ami.ubuntu.id
   instance_type               = var.ruvector_instance_type
@@ -59,6 +61,7 @@ resource "aws_instance" "ruvector" {
   vpc_security_group_ids      = [aws_security_group.ruvector.id]
   iam_instance_profile        = aws_iam_instance_profile.ruvector.name
   associate_public_ip_address = true
+  key_name                    = var.key_pair_name != "" ? var.key_pair_name : null
 
   root_block_device {
     volume_size           = 20
@@ -68,7 +71,6 @@ resource "aws_instance" "ruvector" {
 
   user_data = base64encode(templatefile("${path.module}/user_data/ruvector.sh", {
     aws_region = var.aws_region
-    log_group  = aws_cloudwatch_log_group.ruvector.name
   }))
 
   user_data_replace_on_change = true

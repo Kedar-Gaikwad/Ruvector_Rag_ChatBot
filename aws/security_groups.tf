@@ -28,10 +28,11 @@ resource "aws_security_group" "alb" {
   }
 }
 
-# RAG App Security Group - Only from ALB + SSH from admin
+# RAG App Security Group
+# Accepts traffic from ALB on 8000 and SSH from admin via SSM (no direct SSH needed)
 resource "aws_security_group" "rag_app" {
   name        = "ruvector-rag-app-sg"
-  description = "Allow traffic to RAG App from ALB and admin SSH"
+  description = "Allow traffic to RAG App from ALB only"
   vpc_id      = aws_vpc.main.id
 
   ingress {
@@ -65,15 +66,23 @@ resource "aws_security_group" "rag_app" {
 # RuVector Security Group - Only from RAG App on port 6333
 resource "aws_security_group" "ruvector" {
   name        = "ruvector-ruvector-sg"
-  description = "Allow traffic to RuVector only from RAG App"
+  description = "Allow Qdrant REST API only from RAG App security group"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description     = "RuVector API from RAG App"
+    description     = "Qdrant REST API from RAG App"
     from_port       = 6333
     to_port         = 6333
     protocol        = "tcp"
     security_groups = [aws_security_group.rag_app.id]
+  }
+
+  ingress {
+    description = "Qdrant REST API from admin (debugging)"
+    from_port   = 6333
+    to_port     = 6333
+    protocol    = "tcp"
+    cidr_blocks = [var.admin_ip_cidr]
   }
 
   ingress {
@@ -97,17 +106,18 @@ resource "aws_security_group" "ruvector" {
 }
 
 # VPC Endpoints Security Group
+# Instances are in the public subnet (10.0.1.0/24) - allow HTTPS inbound from there
 resource "aws_security_group" "vpc_endpoints" {
   name        = "ruvector-rag-vpce-sg"
-  description = "Allow HTTPS from private subnet to VPC endpoints"
+  description = "Allow HTTPS from public subnet to VPC endpoints"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "HTTPS from private subnet"
+    description = "HTTPS from public subnet"
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = ["10.0.2.0/24"]
+    cidr_blocks = ["10.0.1.0/24"]
   }
 
   egress {

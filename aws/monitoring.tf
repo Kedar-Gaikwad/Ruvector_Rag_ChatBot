@@ -1,28 +1,6 @@
 # ============================================================================
-# MONITORING - CloudWatch Log Groups and Budget Alarm
+# MONITORING - Budget Alarm
 # ============================================================================
-
-# CloudWatch Log Group for RAG App
-resource "aws_cloudwatch_log_group" "rag_app" {
-  name              = "/ruvector-rag/rag-app"
-  retention_in_days = 7
-
-  tags = {
-    Name    = "ruvector-rag-app-logs"
-    Service = "rag-app"
-  }
-}
-
-# CloudWatch Log Group for RuVector Service
-resource "aws_cloudwatch_log_group" "ruvector" {
-  name              = "/ruvector-rag/ruvector"
-  retention_in_days = 7
-
-  tags = {
-    Name    = "ruvector-ruvector-logs"
-    Service = "ruvector"
-  }
-}
 
 # AWS Budget - $50/month alarm
 resource "aws_budgets_budget" "monthly" {

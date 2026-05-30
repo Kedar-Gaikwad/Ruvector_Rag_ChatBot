@@ -1,0 +1,11 @@
+# Credentials - never commit
+.env
+
+# Terraform state (contains resource IDs and may contain secrets)
+aws/terraform.tfstate
+aws/terraform.tfstate.backup
+aws/.terraform/
+
+# OS
+.DS_Store
+Thumbs.db

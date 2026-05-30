@@ -24,13 +24,13 @@ resource "aws_iam_role" "rag_app" {
   }
 }
 
-# SSM for secure instance access
+# SSM - Session Manager shell access (no bastion host needed)
 resource "aws_iam_role_policy_attachment" "rag_app_ssm" {
   role       = aws_iam_role.rag_app.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Bedrock access for embeddings and LLM
+# Bedrock - Titan embeddings + Claude LLM
 resource "aws_iam_policy" "bedrock_access" {
   name        = "ruvector-rag-bedrock-policy"
   description = "Allows RAG app to invoke Bedrock models for embeddings and LLM"
@@ -55,38 +55,10 @@ resource "aws_iam_role_policy_attachment" "rag_app_bedrock" {
   policy_arn = aws_iam_policy.bedrock_access.arn
 }
 
-# CloudWatch Logs access
-resource "aws_iam_policy" "cloudwatch_logs" {
-  name        = "ruvector-rag-cloudwatch-policy"
-  description = "Allows services to write logs to CloudWatch"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogGroup",
-          "logs:CreateLogStream",
-          "logs:PutLogEvents",
-          "logs:DescribeLogGroups",
-          "logs:DescribeLogStreams"
-        ]
-        Resource = "arn:aws:logs:${var.aws_region}:*:*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "rag_app_cloudwatch" {
-  role       = aws_iam_role.rag_app.name
-  policy_arn = aws_iam_policy.cloudwatch_logs.arn
-}
-
-# ECR access for pulling Docker images
+# ECR - pull qdrant and rag-chatbot images
 resource "aws_iam_policy" "ecr_access" {
   name        = "ruvector-rag-ecr-policy"
-  description = "Allows EC2 instances to pull images from ECR"
+  description = "Allows EC2 instances to pull images from ECR and Docker Hub via ECR endpoints"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -137,14 +109,16 @@ resource "aws_iam_role" "ruvector" {
   }
 }
 
+# SSM - Session Manager shell access for RuVector instance
 resource "aws_iam_role_policy_attachment" "ruvector_ssm" {
   role       = aws_iam_role.ruvector.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-resource "aws_iam_role_policy_attachment" "ruvector_cloudwatch" {
+# ECR - pull qdrant image
+resource "aws_iam_role_policy_attachment" "ruvector_ecr" {
   role       = aws_iam_role.ruvector.name
-  policy_arn = aws_iam_policy.cloudwatch_logs.arn
+  policy_arn = aws_iam_policy.ecr_access.arn
 }
 
 resource "aws_iam_instance_profile" "ruvector" {

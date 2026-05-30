@@ -8,7 +8,7 @@ import logging
 import json
 import re
 from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -265,26 +265,58 @@ class ChatQuery(BaseModel):
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for ALB. Returns 200 if service is ready."""
-    # Check RuVector connectivity
-    ruvector_status = "unknown"
+    """Health check for ALB. Always returns 200 — reports component status in body."""
+    # Check Qdrant connectivity
+    qdrant_status = "unknown"
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{RUVECTOR_URL}/health", timeout=3.0)
-            ruvector_status = "healthy" if resp.status_code == 200 else "unhealthy"
-    except Exception:
-        ruvector_status = "unavailable"
+            qdrant_status = "healthy" if resp.status_code == 200 else f"unhealthy:{resp.status_code}"
+    except Exception as e:
+        qdrant_status = f"unavailable:{str(e)[:60]}"
+
+    # Check Bedrock connectivity (lightweight: just verify credentials resolve)
+    bedrock_status = "unknown"
+    if bedrock_client:
+        try:
+            # list_foundation_models is a cheap read-only call to verify auth
+            bedrock_client.list_foundation_models(byOutputModality="TEXT")
+            bedrock_status = "healthy"
+        except Exception as e:
+            bedrock_status = f"error:{str(e)[:80]}"
+    else:
+        bedrock_status = "client_not_initialized"
 
     return JSONResponse(
         status_code=200,
         content={
             "status": "healthy",
             "service": "rag-app",
-            "ruvector": ruvector_status,
+            "qdrant": qdrant_status,
+            "bedrock": bedrock_status,
             "embedding_provider": EMBEDDING_PROVIDER,
-            "llm_provider": LLM_PROVIDER
+            "llm_provider": LLM_PROVIDER,
+            "ruvector_url": RUVECTOR_URL,
+            "aws_region": AWS_REGION,
         }
     )
+
+
+@app.get("/health/bedrock")
+async def health_bedrock():
+    """Deep Bedrock check — actually calls Titan Embed to verify end-to-end."""
+    if not bedrock_client:
+        raise HTTPException(status_code=503, detail="Bedrock client not initialized")
+    try:
+        test_embedding = get_embedding("health check test")
+        return {
+            "status": "healthy",
+            "model": "amazon.titan-embed-text-v2:0",
+            "embedding_dimensions": len(test_embedding),
+            "sample_values": test_embedding[:3]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Bedrock embedding failed: {e}")
 
 
 # ============================================================================
@@ -292,29 +324,20 @@ async def health_check():
 # ============================================================================
 
 @app.post("/ingest")
-async def ingest_document(file: UploadFile = File(...), collection: str = Form("finance_docs")):
-    """Upload and process documents up to 100 MB with streaming and progress tracking."""
-    start_time = time.time()
+async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...), collection: str = Form("finance_docs")):
+    """
+    Accept the upload immediately, stream to disk, then process in the background.
+    Returns a job_id right away — client polls /ingest/status/{job_id} for progress.
+    This avoids ALB 504 timeouts on large documents.
+    """
     filename = file.filename
     job_id = str(uuid.uuid4())
     request_id = job_id[:8]
 
-    logger.info(f"Ingestion started: {filename} -> collection={collection}", extra={'request_id': request_id})
+    logger.info(f"Ingest request received: {filename} -> collection={collection}", extra={'request_id': request_id})
 
-    # Initialize job status
-    ingestion_jobs[job_id] = {
-        "job_id": job_id,
-        "filename": filename,
-        "status": "processing",
-        "progress_pct": 0,
-        "total_pages": 0,
-        "processed_pages": 0,
-        "chunks_created": 0,
-        "error": None
-    }
-
+    # Stream file to a temp file immediately so we can release the HTTP connection
     try:
-        # Stream file to temp storage in chunks (max 10 MB in memory at once)
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}")
         total_size = 0
         chunk_size = 10 * 1024 * 1024  # 10 MB
@@ -327,19 +350,49 @@ async def ingest_document(file: UploadFile = File(...), collection: str = Form("
             if total_size > MAX_UPLOAD_SIZE:
                 temp_file.close()
                 os.unlink(temp_file.name)
-                ingestion_jobs[job_id]["status"] = "failed"
-                ingestion_jobs[job_id]["error"] = "File exceeds 100 MB limit"
                 raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 100 MB")
             temp_file.write(chunk)
 
         temp_file.close()
         logger.info(f"File streamed to disk: {total_size} bytes", extra={'request_id': request_id})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to receive file: {e}")
 
+    # Register job as queued
+    ingestion_jobs[job_id] = {
+        "job_id": job_id,
+        "filename": filename,
+        "status": "processing",
+        "progress_pct": 5,
+        "total_pages": 0,
+        "processed_pages": 0,
+        "chunks_created": 0,
+        "error": None
+    }
+
+    # Kick off background processing — HTTP response returns immediately
+    background_tasks.add_task(_process_ingest, job_id, temp_file.name, filename, collection, request_id)
+
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "filename": filename,
+        "message": "Document received. Poll /ingest/status/{job_id} for progress."
+    }
+
+
+async def _process_ingest(job_id: str, temp_path: str, filename: str, collection: str, request_id: str):
+    """Background task: parse, chunk, embed, and upsert the document."""
+    start_time = time.time()
+
+    try:
         # Parse file content
         content = ""
         try:
             if filename.endswith(".pdf"):
-                reader = PdfReader(temp_file.name)
+                reader = PdfReader(temp_path)
                 total_pages = len(reader.pages)
                 ingestion_jobs[job_id]["total_pages"] = total_pages
                 for i, page in enumerate(reader.pages):
@@ -347,41 +400,46 @@ async def ingest_document(file: UploadFile = File(...), collection: str = Form("
                     if text:
                         content += text + "\n"
                     ingestion_jobs[job_id]["processed_pages"] = i + 1
-                    ingestion_jobs[job_id]["progress_pct"] = int(((i + 1) / total_pages) * 50)
+                    ingestion_jobs[job_id]["progress_pct"] = int(((i + 1) / total_pages) * 40) + 5
             elif filename.endswith((".xlsx", ".xls")):
-                df_dict = pd.read_excel(temp_file.name, sheet_name=None)
+                df_dict = pd.read_excel(temp_path, sheet_name=None)
                 total_sheets = len(df_dict)
                 ingestion_jobs[job_id]["total_pages"] = total_sheets
                 for i, (sheet, df) in enumerate(df_dict.items()):
                     content += f"\nSheet: {sheet}\n"
                     content += df.to_csv(index=False) + "\n"
                     ingestion_jobs[job_id]["processed_pages"] = i + 1
-                    ingestion_jobs[job_id]["progress_pct"] = int(((i + 1) / total_sheets) * 50)
+                    ingestion_jobs[job_id]["progress_pct"] = int(((i + 1) / total_sheets) * 40) + 5
             elif filename.endswith(".csv"):
-                df = pd.read_csv(temp_file.name)
+                df = pd.read_csv(temp_path)
                 content = df.to_csv(index=False)
                 ingestion_jobs[job_id]["total_pages"] = 1
                 ingestion_jobs[job_id]["processed_pages"] = 1
-                ingestion_jobs[job_id]["progress_pct"] = 50
+                ingestion_jobs[job_id]["progress_pct"] = 45
             else:
-                with open(temp_file.name, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(temp_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
-                ingestion_jobs[job_id]["progress_pct"] = 50
+                ingestion_jobs[job_id]["progress_pct"] = 45
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to parse document: {e}")
+            ingestion_jobs[job_id]["status"] = "failed"
+            ingestion_jobs[job_id]["error"] = f"Failed to parse document: {e}"
+            return
         finally:
-            os.unlink(temp_file.name)
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
         if not content.strip():
             ingestion_jobs[job_id]["status"] = "failed"
             ingestion_jobs[job_id]["error"] = "Document content is empty"
-            raise HTTPException(status_code=400, detail="Document content is empty.")
+            return
 
         # Chunking
         chunker = SmartFinancialChunker(chunk_size=700, overlap=120)
         chunks = chunker.chunk_document(content, filename)
         logger.info(f"Generated {len(chunks)} chunks", extra={'request_id': request_id})
-        ingestion_jobs[job_id]["progress_pct"] = 60
+        ingestion_jobs[job_id]["progress_pct"] = 55
 
         # Update BM25 index
         if collection not in bm25_indices:
@@ -389,18 +447,23 @@ async def ingest_document(file: UploadFile = File(...), collection: str = Form("
         all_chunks = bm25_indices[collection].documents_metadata + chunks
         bm25_indices[collection].fit(all_chunks)
 
-        # Create collection in RuVector
+        # Create/ensure collection exists in Qdrant
+        # Qdrant API: PUT /collections/{name}
+        # Body: {"vectors": {"size": dim, "distance": "Cosine"}}
         dim = get_vector_dimension()
         async with httpx.AsyncClient(timeout=10.0) as client:
             try:
-                await client.post(f"{RUVECTOR_URL}/collections", json={
-                    "name": collection, "dimension": dim, "metric": "Cosine"
-                })
+                r = await client.put(
+                    f"{RUVECTOR_URL}/collections/{collection}",
+                    json={"vectors": {"size": dim, "distance": "Cosine"}}
+                )
+                # 200 = updated, 201 = created — both are fine
+                if r.status_code not in (200, 201):
+                    logger.warning(f"Collection create/update returned {r.status_code}: {r.text}", extra={'request_id': request_id})
             except Exception as e:
                 logger.warning(f"Could not create collection: {e}", extra={'request_id': request_id})
 
-        # Generate embeddings and upload vectors IN BATCHES
-        # Process 10 chunks at a time to avoid OOM and keep health checks responsive
+        # Generate embeddings and upsert in batches
         BATCH_SIZE = 10
         total_chunks = len(chunks)
         inserted_count = 0
@@ -416,59 +479,46 @@ async def ingest_document(file: UploadFile = File(...), collection: str = Form("
                     meta = chunk["metadata"]
                     meta["text"] = chunk["text"]
                     batch_vectors.append({
-                        "id": f"{filename}_{batch_start + idx}_{int(time.time())}",
+                        "id": str(uuid.uuid4()),   # Qdrant requires UUID or uint64
                         "vector": vector,
-                        "metadata": meta
+                        "payload": meta            # Qdrant uses "payload" not "metadata"
                     })
                 except Exception as e:
                     logger.error(f"Embedding chunk {batch_start + idx} failed: {e}", extra={'request_id': request_id})
 
-                # Yield to event loop so health checks can respond
                 await asyncio.sleep(0)
 
-            # Upsert this batch immediately (don't accumulate all in memory)
             if batch_vectors:
                 try:
                     async with httpx.AsyncClient(timeout=60.0) as client:
+                        # Qdrant upsert: PUT /collections/{name}/points
+                        # Body: {"points": [{"id": uuid, "vector": [...], "payload": {...}}]}
                         url = f"{RUVECTOR_URL}/collections/{collection}/points"
                         response = await client.put(url, json={"points": batch_vectors})
-                        if response.status_code == 200:
+                        if response.status_code in (200, 201):
                             inserted_count += len(batch_vectors)
                         else:
-                            logger.error(f"RuVector batch upsert failed: {response.text}", extra={'request_id': request_id})
+                            logger.error(f"Qdrant batch upsert failed {response.status_code}: {response.text}", extra={'request_id': request_id})
                 except Exception as e:
-                    logger.error(f"RuVector batch upsert error: {e}", extra={'request_id': request_id})
+                    logger.error(f"Qdrant batch upsert error: {e}", extra={'request_id': request_id})
 
-            # Update progress (60-95% range)
-            progress = 60 + int((batch_end / total_chunks) * 35)
+            # Progress: 55-95% range
+            progress = 55 + int((batch_end / total_chunks) * 40)
             ingestion_jobs[job_id]["progress_pct"] = progress
             ingestion_jobs[job_id]["chunks_created"] = inserted_count
 
-            # Brief pause between batches to prevent overloading
             await asyncio.sleep(0.1)
 
-        # Success
+        elapsed = time.time() - start_time
         ingestion_jobs[job_id]["status"] = "completed"
         ingestion_jobs[job_id]["progress_pct"] = 100
         ingestion_jobs[job_id]["chunks_created"] = inserted_count
+        logger.info(f"Ingestion complete: {inserted_count} chunks in {elapsed:.1f}s", extra={'request_id': request_id})
 
-        elapsed = time.time() - start_time
-        return {
-            "status": "success",
-            "job_id": job_id,
-            "filename": filename,
-            "chunks": len(chunks),
-            "inserted_points": inserted_count,
-            "elapsed_seconds": round(elapsed, 2)
-        }
-
-    except HTTPException:
-        raise
     except Exception as e:
         ingestion_jobs[job_id]["status"] = "failed"
         ingestion_jobs[job_id]["error"] = str(e)
-        logger.error(f"Ingestion failed: {e}", extra={'request_id': request_id})
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {e}")
+        logger.error(f"Background ingestion failed: {e}", extra={'request_id': request_id})
 
 
 @app.get("/ingest/status/{job_id}")
@@ -502,16 +552,27 @@ async def chat(query: ChatQuery):
 
     logger.info(f"Query: '{message}' collection={collection}", extra={'request_id': request_id})
 
-    # Dense retrieval from RuVector
+    # Dense retrieval from Qdrant
     dense_results = []
     try:
         query_vector = get_embedding(message)
         async with httpx.AsyncClient() as client:
+            # Qdrant search: POST /collections/{name}/points/search
+            # Body: {"vector": [...], "limit": 20, "with_payload": true}
+            # Response: [{"id": ..., "score": ..., "payload": {...}}, ...]
             url = f"{RUVECTOR_URL}/collections/{collection}/points/search"
-            payload = {"vector": query_vector, "k": 20, "filter": None}
+            payload = {"vector": query_vector, "limit": 20, "with_payload": True}
             response = await client.post(url, json=payload, timeout=10.0)
             if response.status_code == 200:
-                dense_results = response.json().get("results", [])
+                raw = response.json()
+                # Qdrant returns the list directly (not wrapped in "results")
+                hits = raw if isinstance(raw, list) else raw.get("result", [])
+                for hit in hits:
+                    dense_results.append({
+                        "id": str(hit.get("id")),
+                        "score": hit.get("score", 0.0),
+                        "metadata": hit.get("payload", {})  # Qdrant calls it payload
+                    })
     except Exception as e:
         logger.error(f"Dense search failed: {e}", extra={'request_id': request_id})
 
@@ -630,12 +691,17 @@ async def clear_collection(collection: str = Form("finance_docs")):
         if collection in bm25_indices:
             bm25_indices[collection] = SimpleBM25()
 
+        dim = get_vector_dimension()
         async with httpx.AsyncClient() as client:
+            # Delete then recreate with correct Qdrant API
             await client.delete(f"{RUVECTOR_URL}/collections/{collection}", timeout=5.0)
-            dim = get_vector_dimension()
-            await client.post(f"{RUVECTOR_URL}/collections", json={
-                "name": collection, "dimension": dim, "metric": "Cosine"
-            }, timeout=5.0)
+            r = await client.put(
+                f"{RUVECTOR_URL}/collections/{collection}",
+                json={"vectors": {"size": dim, "distance": "Cosine"}},
+                timeout=5.0
+            )
+            if r.status_code not in (200, 201):
+                raise Exception(f"Recreate failed: {r.text}")
             return {"status": "success", "message": f"Collection '{collection}' cleared."}
     except Exception as e:
         logger.error(f"Failed to clear collection: {e}", extra={'request_id': 'clear'})

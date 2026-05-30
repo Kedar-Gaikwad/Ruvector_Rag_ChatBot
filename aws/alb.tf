@@ -9,6 +9,10 @@ resource "aws_lb" "main" {
   security_groups    = [aws_security_group.alb.id]
   subnets            = [aws_subnet.public.id, aws_subnet.public_b.id]
 
+  # Raised to 300s to cover large document ingestion jobs.
+  # The frontend polls /ingest/status so the connection stays alive.
+  idle_timeout = 300
+
   tags = {
     Name = "ruvector-rag-alb"
   }

@@ -1,13 +1,16 @@
 # ============================================================================
 # VPC ENDPOINTS - Private AWS service access (no NAT Gateway needed)
+# Both EC2 instances are in the public subnet and have internet access for
+# git clone / docker pull. VPC endpoints are used so that Bedrock and SSM
+# API calls stay inside the AWS network (lower latency, no data transfer cost).
 # ============================================================================
 
-# Bedrock Runtime VPC Endpoint
+# Bedrock Runtime - embedding (Titan) and LLM (Claude) calls from RAG App
 resource "aws_vpc_endpoint" "bedrock" {
   vpc_id              = aws_vpc.main.id
   service_name        = "com.amazonaws.${var.aws_region}.bedrock-runtime"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
+  subnet_ids          = [aws_subnet.public.id]
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   private_dns_enabled = true
 
@@ -16,12 +19,12 @@ resource "aws_vpc_endpoint" "bedrock" {
   }
 }
 
-# ECR API VPC Endpoint
+# ECR API - image metadata
 resource "aws_vpc_endpoint" "ecr_api" {
   vpc_id              = aws_vpc.main.id
   service_name        = "com.amazonaws.${var.aws_region}.ecr.api"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
+  subnet_ids          = [aws_subnet.public.id]
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   private_dns_enabled = true
 
@@ -30,12 +33,12 @@ resource "aws_vpc_endpoint" "ecr_api" {
   }
 }
 
-# ECR Docker VPC Endpoint
+# ECR DKR - image layer pulls
 resource "aws_vpc_endpoint" "ecr_dkr" {
   vpc_id              = aws_vpc.main.id
   service_name        = "com.amazonaws.${var.aws_region}.ecr.dkr"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
+  subnet_ids          = [aws_subnet.public.id]
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   private_dns_enabled = true
 
@@ -44,38 +47,24 @@ resource "aws_vpc_endpoint" "ecr_dkr" {
   }
 }
 
-# CloudWatch Logs VPC Endpoint
-resource "aws_vpc_endpoint" "cloudwatch_logs" {
-  vpc_id              = aws_vpc.main.id
-  service_name        = "com.amazonaws.${var.aws_region}.logs"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
-  security_group_ids  = [aws_security_group.vpc_endpoints.id]
-  private_dns_enabled = true
-
-  tags = {
-    Name = "ruvector-rag-cloudwatch-vpce"
-  }
-}
-
-# S3 Gateway Endpoint (needed for ECR image layers, free)
+# S3 Gateway - ECR image layer storage (free, no hourly charge)
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.main.id
   service_name      = "com.amazonaws.${var.aws_region}.s3"
   vpc_endpoint_type = "Gateway"
-  route_table_ids   = [aws_route_table.private.id]
+  route_table_ids   = [aws_route_table.public.id]
 
   tags = {
     Name = "ruvector-rag-s3-vpce"
   }
 }
 
-# SSM Endpoints for Systems Manager access
+# SSM - Systems Manager core
 resource "aws_vpc_endpoint" "ssm" {
   vpc_id              = aws_vpc.main.id
   service_name        = "com.amazonaws.${var.aws_region}.ssm"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
+  subnet_ids          = [aws_subnet.public.id]
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   private_dns_enabled = true
 
@@ -84,11 +73,12 @@ resource "aws_vpc_endpoint" "ssm" {
   }
 }
 
+# SSM Messages - Session Manager shell access
 resource "aws_vpc_endpoint" "ssm_messages" {
   vpc_id              = aws_vpc.main.id
   service_name        = "com.amazonaws.${var.aws_region}.ssmmessages"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
+  subnet_ids          = [aws_subnet.public.id]
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   private_dns_enabled = true
 
@@ -97,11 +87,12 @@ resource "aws_vpc_endpoint" "ssm_messages" {
   }
 }
 
+# EC2 Messages - required for SSM agent communication
 resource "aws_vpc_endpoint" "ec2_messages" {
   vpc_id              = aws_vpc.main.id
   service_name        = "com.amazonaws.${var.aws_region}.ec2messages"
   vpc_endpoint_type   = "Interface"
-  subnet_ids          = [aws_subnet.private.id]
+  subnet_ids          = [aws_subnet.public.id]
   security_group_ids  = [aws_security_group.vpc_endpoints.id]
   private_dns_enabled = true
 

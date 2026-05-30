@@ -1,23 +1,35 @@
 # ============================================================================
 # Local Development Docker Compose
 # Mirrors the multi-service AWS architecture for local testing
+#
+# BEDROCK CREDENTIALS (local dev only):
+#   Option A - env file (recommended, never commit .env):
+#     Copy .env.example to .env and fill in your values, then run:
+#     docker compose --env-file .env up
+#
+#   Option B - mount your AWS credentials directory:
+#     Uncomment the volumes block under rag-chatbot below.
+#
+#   On EC2 the container uses --network host so it inherits the IAM role
+#   via the instance metadata service (169.254.169.254). No creds needed.
 # ============================================================================
 services:
 
-  ruvector-db:
-    image: ruvnet/ruvector:latest
-    container_name: ruvector-db
+  qdrant:
+    image: qdrant/qdrant:v1.9.2
+    container_name: qdrant
     restart: unless-stopped
     ports:
-      - "6333:6333"
+      - "6333:6333"   # REST API  (used by rag-chatbot)
+      - "6334:6334"   # gRPC
     volumes:
-      - ruvector_data:/var/lib/ruvector/data
+      - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:6333/health"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 15s
 
   rag-chatbot:
     build:
@@ -28,16 +40,23 @@ services:
     ports:
       - "80:8000"
     environment:
-      - RUVECTOR_URL=http://ruvector-db:6333
+      - RUVECTOR_URL=http://qdrant:6333
       - EMBEDDING_PROVIDER=bedrock
       - LLM_PROVIDER=bedrock
       - AWS_REGION=us-east-1
-      # For local dev, pass AWS credentials from host
-      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # ----------------------------------------------------------------
+      # LOCAL DEV: supply credentials via .env file (see .env.example)
+      # On EC2 these are NOT needed - IAM role is used automatically.
+      # ----------------------------------------------------------------
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}   # optional, for SSO/assumed roles
+    # Option B: mount host AWS credentials directory instead of env vars
+    # volumes:
+    #   - ${HOME}/.aws:/root/.aws:ro
     depends_on:
-      ruvector-db:
+      qdrant:
         condition: service_healthy
 
 volumes:
-  ruvector_data:
+  qdrant_data:
