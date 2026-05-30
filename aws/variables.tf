@@ -1,37 +1,57 @@
+# ============================================================================
+# INPUT VARIABLES
+# ============================================================================
+
 variable "aws_region" {
   type        = string
   default     = "us-east-1"
-  description = "AWS Region to deploy the low-cost RAG Chatbot"
+  description = "AWS Region to deploy the multi-service RAG architecture"
 }
 
 variable "ami_id" {
   type        = string
   default     = ""
-  description = "Optional AMI ID override. Defaults to standard Ubuntu Arm64 image"
+  description = "Optional AMI ID override. Defaults to Ubuntu 22.04 amd64"
 }
 
 variable "admin_ip_cidr" {
   type        = string
   default     = "0.0.0.0/0"
-  description = "CIDR block allowed to SSH directly (if SSH port is open). Leave default or set to your home IP."
+  description = "CIDR block allowed for SSH access. Set to your IP for security."
 }
 
-# --- APPLICATION VARIABLES ---
+variable "rag_app_instance_type" {
+  type        = string
+  default     = "t3.medium"
+  description = "Instance type for the RAG App (Spot)"
+}
+
+variable "ruvector_instance_type" {
+  type        = string
+  default     = "t3.medium"
+  description = "Instance type for the RuVector Service (On-Demand)"
+}
+
 variable "embedding_provider" {
   type        = string
-  default     = "local"
-  description = "Embedding provider to use: 'local' (zero-cost) or 'openai' / 'bedrock'"
+  default     = "bedrock"
+  description = "Embedding provider: 'bedrock'"
 }
 
 variable "llm_provider" {
   type        = string
-  default     = "openai"
-  description = "LLM provider: 'openai' or 'bedrock' or 'mock'"
+  default     = "bedrock"
+  description = "LLM provider: 'bedrock' or 'mock'"
 }
 
-variable "openai_api_key" {
+variable "budget_alert_email" {
+  type        = string
+  default     = "admin@example.com"
+  description = "Email address for AWS Budget alerts"
+}
+
+variable "key_pair_name" {
   type        = string
   default     = ""
-  sensitive   = true
-  description = "Optional: OpenAI API Key. Leave blank if using AWS Bedrock or Mock offline mode"
+  description = "Optional EC2 key pair name for SSH access"
 }

@@ -1,32 +1,50 @@
 import os
 import time
+import uuid
+import asyncio
+import tempfile
 import httpx
 import logging
 import json
 import re
-from typing import List, Dict, Any, Optional, Tuple
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import List, Dict, Any, Optional
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import numpy as np
 import pandas as pd
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from openai import OpenAI
 import boto3
+from botocore.config import Config as BotoConfig
 
 from chunker import SmartFinancialChunker
 from bm25 import SimpleBM25
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("rag-app")
+# ============================================================================
+# LOGGING CONFIGURATION - Structured for CloudWatch Logs Insights
+# ============================================================================
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s service=rag-app level=%(levelname)s request_id=%(request_id)s %(message)s',
+    datefmt='%Y-%m-%dT%H:%M:%S'
+)
 
+# Custom filter to add request_id to all log records
+class RequestIdFilter(logging.Filter):
+    def filter(self, record):
+        if not hasattr(record, 'request_id'):
+            record.request_id = 'system'
+        return True
+
+logger = logging.getLogger("rag-app")
+logger.addFilter(RequestIdFilter())
+
+# ============================================================================
+# APPLICATION SETUP
+# ============================================================================
 app = FastAPI(title="Smart & Cost-Optimized Hybrid RAG API with Guardrails")
 
-# Enable CORS for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,90 +53,86 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration from Environment
-RUVECTOR_URL = os.getenv(
-    "RUVECTOR_URL",
-    "http://172.17.0.1:6333"
-)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+RUVECTOR_URL = os.getenv("RUVECTOR_URL", "http://172.17.0.1:6333")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")  # "local", "openai", "bedrock"
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "bedrock")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "bedrock")
+MAX_UPLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 
-# Default to Bedrock Claude 3.5 Haiku as requested by user
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "bedrock")  # "bedrock", "openai", "mock"
+logger.info("Configuration loaded", extra={'request_id': 'startup'})
+logger.info(f"RUVECTOR_URL={RUVECTOR_URL}, EMBEDDING_PROVIDER={EMBEDDING_PROVIDER}, LLM_PROVIDER={LLM_PROVIDER}", extra={'request_id': 'startup'})
 
-# Initialize local models
-logger.info("Loading local zero-cost embedding model (all-MiniLM-L6-v2)...")
-local_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-
-logger.info("Loading local zero-cost re-ranker model (ms-marco-MiniLM-L-6-v2)...")
-local_reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-# Global in-memory dictionary of BM25 indexes per collection
-bm25_indices: Dict[str, SimpleBM25] = {}
-
-# Initialize API clients
-openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# ============================================================================
+# AWS BEDROCK CLIENT - Uses IAM instance role (no hardcoded credentials)
+# ============================================================================
 bedrock_client = None
 
-if os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"):
+def init_bedrock_client():
+    """Initialize Bedrock client using IAM role credentials from instance metadata."""
+    global bedrock_client
     try:
+        boto_config = BotoConfig(
+            region_name=AWS_REGION,
+            read_timeout=30,
+            connect_timeout=5,
+            retries={'max_attempts': 3, 'mode': 'adaptive'}
+        )
         bedrock_client = boto3.client(
             service_name="bedrock-runtime",
-            region_name=AWS_REGION
+            config=boto_config
         )
-        logger.info("AWS Bedrock client initialized successfully.")
+        logger.info("AWS Bedrock client initialized via IAM role", extra={'request_id': 'startup'})
     except Exception as e:
-        logger.warning(f"Failed to initialize AWS Bedrock: {e}")
+        logger.warning(f"Failed to initialize Bedrock client: {e}", extra={'request_id': 'startup'})
 
-# Helper to get embeddings
+init_bedrock_client()
+
+# ============================================================================
+# IN-MEMORY STATE
+# ============================================================================
+bm25_indices: Dict[str, SimpleBM25] = {}
+ingestion_jobs: Dict[str, Dict[str, Any]] = {}  # job_id -> status dict
+
+# ============================================================================
+# EMBEDDING FUNCTIONS
+# ============================================================================
+
 def get_embedding(text: str) -> List[float]:
-    if EMBEDDING_PROVIDER == "openai" and openai_client:
-        try:
-            response = openai_client.embeddings.create(
-                input=[text],
-                model="text-embedding-3-small"
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            logger.error(f"OpenAI embedding error, falling back to local: {e}")
-            
-    elif EMBEDDING_PROVIDER == "bedrock" and bedrock_client:
-        try:
-            body = json.dumps({"inputText": text})
-            response = bedrock_client.invoke_model(
-                body=body,
-                modelId="amazon.titan-embed-text-v2:0",
-                accept="application/json",
-                contentType="application/json"
-            )
-            response_body = json.loads(response.get('body').read())
-            return response_body.get('embedding')
-        except Exception as e:
-            logger.error(f"Bedrock embedding error, falling back to local: {e}")
-            
-    # Default local embedding (dim = 384)
-    vector = local_embed_model.encode(text)
-    return vector.tolist()
+    """Generate embeddings using AWS Bedrock Titan Embed v2 (1024 dimensions)."""
+    if EMBEDDING_PROVIDER != "bedrock" or not bedrock_client:
+        raise RuntimeError("No embedding provider available. EMBEDDING_PROVIDER=bedrock required with valid IAM role.")
 
-# Helper to get vector dimensions
+    try:
+        body = json.dumps({"inputText": text})
+        response = bedrock_client.invoke_model(
+            body=body,
+            modelId="amazon.titan-embed-text-v2:0",
+            accept="application/json",
+            contentType="application/json"
+        )
+        response_body = json.loads(response.get('body').read())
+        return response_body.get('embedding')
+    except Exception as e:
+        logger.error(f"Bedrock embedding error: {e}", extra={'request_id': 'embedding'})
+        raise RuntimeError(f"Embedding generation failed: {e}")
+
+
 def get_vector_dimension() -> int:
-    if EMBEDDING_PROVIDER == "openai":
-        return 1536
-    elif EMBEDDING_PROVIDER == "bedrock":
-        return 1536
-    return 384
+    return 1024  # Bedrock Titan Embed v2
 
-# Reciprocal Rank Fusion (RRF) to blend Sparse (BM25) and Dense (RuVector) retrieval lists
+
+# ============================================================================
+# HYBRID RETRIEVAL - Reciprocal Rank Fusion
+# ============================================================================
+
 def reciprocal_rank_fusion(dense_results: List[Dict], sparse_results: List[Dict], k_rrf: int = 60) -> List[Dict]:
-    """
-    Blends dense and sparse retrieval ranks using Reciprocal Rank Fusion.
-    Ensures both exact keyword hits and conceptual meanings are accurately represented.
-    """
+    """Blends dense and sparse retrieval using RRF scoring."""
     scores: Dict[str, float] = {}
     doc_map: Dict[str, Dict] = {}
 
-    # Rank positions
     for rank, doc in enumerate(dense_results):
         doc_id = doc["id"]
         doc_map[doc_id] = doc
@@ -126,18 +140,12 @@ def reciprocal_rank_fusion(dense_results: List[Dict], sparse_results: List[Dict]
 
     for rank, doc in enumerate(sparse_results):
         doc_id = doc["id"]
-        # Merge metadata
         if doc_id not in doc_map:
-            doc_map[doc_id] = {
-                "id": doc_id,
-                "score": 0.0,
-                "metadata": doc["metadata"]
-            }
+            doc_map[doc_id] = {"id": doc_id, "score": 0.0, "metadata": doc["metadata"]}
         scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (k_rrf + rank + 1))
 
-    # Sort merged documents by fused RRF score
     sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    
+
     fused_results = []
     for doc_id, rrf_score in sorted_docs:
         doc = doc_map[doc_id].copy()
@@ -146,14 +154,13 @@ def reciprocal_rank_fusion(dense_results: List[Dict], sparse_results: List[Dict]
 
     return fused_results
 
-# --- GUARDRAIL LAYER ---
+
+# ============================================================================
+# GUARDRAIL LAYER
+# ============================================================================
 
 def run_input_guardrail(query: str) -> Optional[str]:
-    """
-    Checks for malicious queries, prompt injections, or irrelevant domains.
-    Returns refusal text if blocked, otherwise None.
-    """
-    # 1. Check for prompt injection keywords
+    """Checks for prompt injection and domain relevance."""
     injection_patterns = [
         r"ignore previous instructions",
         r"system prompt",
@@ -163,81 +170,65 @@ def run_input_guardrail(query: str) -> Optional[str]:
     ]
     for pattern in injection_patterns:
         if re.search(pattern, query, re.IGNORECASE):
-            return "Security Notice: Your query has been flagged by the system guardrail for attempting prompt override. Please ask standard financial analysis questions."
+            return "Security Notice: Your query has been flagged for attempting prompt override. Please ask standard financial analysis questions."
 
-    # 2. Check for domain relevance (Financial documents)
     financial_keywords = [
-        "revenue", "profit", "loss", "ebitda", "cash", "debt", "equity", "asset", "liability", 
+        "revenue", "profit", "loss", "ebitda", "cash", "debt", "equity", "asset", "liability",
         "sheet", "statement", "fy", "q1", "q2", "q3", "q4", "finance", "stock", "shares", "growth",
-        "margin", "audit", "tax", "report", "company", "net", "gross", "income", "liability", "rate"
+        "margin", "audit", "tax", "report", "company", "net", "gross", "income", "rate"
     ]
-    
-    # Check if any word in query matches financial domain keywords, or if query is very short
+
     query_words = re.findall(r'\b[a-z]{3,}\b', query.lower())
-    if len(query_words) > 3:  # Only enforce on longer queries to avoid false positives on greetings
+    if len(query_words) > 3:
         matches = [word for word in query_words if word in financial_keywords]
         if not matches:
-            return "Domain Guardrail: I am an intelligent chatbot specialized strictly in corporate and financial documents. Please ask a question related to financial reports, numbers, or balance sheets."
-            
+            return "Domain Guardrail: I am specialized in corporate and financial documents. Please ask a question related to financial reports."
+
     return None
 
-def run_context_gate_guardrail(top_rerank_score: float) -> bool:
-    """
-    Context Score Gate: If the semantic similarity score is below the threshold,
-    we block the query before calling Bedrock to prevent hallucinations and save money.
-    """
-    # For cross-encoder/ms-marco-MiniLM-L-6-v2, scores below -5.0 generally indicate poor semantic match.
-    MIN_RERANK_THRESHOLD = -5.0
-    return top_rerank_score >= MIN_RERANK_THRESHOLD
 
 def run_output_guardrail(response: str, contexts: List[str]) -> str:
-    """
-    Ensures that the LLM response does not hallucinate arbitrary numbers.
-    Appends standard professional disclaimer.
-    """
-    # 1. Scan for large numbers in response and verify they exist in the matching source texts
-    # Finds numbers like $124.5M, 1,450,000, 45.2%
+    """Verifies response numbers against context and appends disclaimer."""
     numbers_in_response = re.findall(r'\b\d+(?:[.,]\d+)?\s*(?:%|m|b|million|billion)?\b', response.lower())
-    
-    # Build single context string to verify against
     context_str = " ".join(contexts).lower()
-    
+
     hallucination_flag = False
     for num in numbers_in_response:
-        # Skip small helper numbers (like 1, 2, 2024, etc.)
         if len(num) > 2 and num not in ["2023", "2024", "2025", "2026"]:
-            # If the specific metric/number is not physically present in context, flag it
             if num not in context_str:
-                logger.warning(f"Guardrail flagged potential hallucinated number: {num}")
+                logger.warning(f"Guardrail flagged potential hallucinated number: {num}", extra={'request_id': 'output'})
                 hallucination_flag = True
-                
-    # If a flag occurred, append a citation warning
+
     warning_suffix = ""
     if hallucination_flag:
-        warning_suffix = "\n\n> [!WARNING]\n> *Note: Some metrics in this answer could not be verified directly in the active context extracts. Please refer to the raw citations in the side panel for exact numbers.*"
+        warning_suffix = "\n\n> [!WARNING]\n> *Note: Some metrics could not be verified directly in context. Please verify with source documents.*"
 
-    disclaimer = "\n\n---\n*Disclaimer: This response is generated based on corporate financial reports. This chatbot does not provide certified financial advice. Please verify key numbers directly inside source documents.*"
-    
+    disclaimer = "\n\n---\n*Disclaimer: Generated from corporate financial reports. Not certified financial advice. Verify key numbers in source documents.*"
+
     return response + warning_suffix + disclaimer
 
-# Helper to call Bedrock Claude 3.5 Haiku (Cost-Efficient and Intelligent)
+
+# ============================================================================
+# BEDROCK LLM CALL
+# ============================================================================
+
 def call_bedrock_haiku(query: str, contexts: List[str]) -> str:
+    """Calls Claude 3.5 Haiku via AWS Bedrock for RAG generation."""
     if not bedrock_client:
-        return "AWS Bedrock client is not initialized. Please verify AWS credentials."
+        return "AWS Bedrock client is not initialized. Verify IAM role credentials."
 
     context_str = "\n\n---\n\n".join(contexts)
     system_prompt = (
-        "You are an expert financial analyst chatbot. Your task is to answer the user's question based strictly on the provided financial document extracts.\n"
+        "You are an expert financial analyst chatbot. Answer based strictly on the provided extracts.\n"
         "Rules:\n"
-        "1. Ground all numbers, percentages, and statements in the extracts. Cite the exact Source document name.\n"
-        "2. If the document extracts do not contain the answer, say clearly that you do not have sufficient information in the loaded financial documents.\n"
-        "3. Do not speculate or extrapolate financial metrics beyond what is given.\n"
-        "4. Format tabular data or balance sheet extracts cleanly using markdown tables."
+        "1. Ground all numbers in the extracts. Cite source document names.\n"
+        "2. If extracts don't contain the answer, say clearly you lack sufficient information.\n"
+        "3. Do not speculate or extrapolate beyond given data.\n"
+        "4. Format tabular data using markdown tables."
     )
     user_prompt = f"Financial Extracts:\n{context_str}\n\nQuestion: {query}"
-    
+
     try:
-        # Use Claude 3.5 Haiku - latest, smartest, cheapest Bedrock model for fast extraction
         body = json.dumps({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": 1000,
@@ -245,287 +236,355 @@ def call_bedrock_haiku(query: str, contexts: List[str]) -> str:
             "messages": [{"role": "user", "content": user_prompt}],
             "temperature": 0.1
         })
-        
+
         response = bedrock_client.invoke_model(
             body=body,
-            modelId="anthropic.claude-3-5-haiku-20241022-v1:0",  # Bedrock Claude 3.5 Haiku
+            modelId="anthropic.claude-3-5-haiku-20241022-v1:0",
             accept="application/json",
             contentType="application/json"
         )
         response_body = json.loads(response.get('body').read())
         return response_body['content'][0]['text']
     except Exception as e:
-        logger.error(f"AWS Bedrock invocation failed: {e}")
-        return f"AWS Bedrock error: {e}"
+        logger.error(f"Bedrock LLM invocation failed: {e}", extra={'request_id': 'llm'})
+        return f"Bedrock error: {e}"
 
-# Helper to call OpenAI GPT-4o-Mini
-def call_openai_mini(query: str, contexts: List[str]) -> str:
-    if not openai_client:
-        return "OpenAI client is not initialized. Please verify API key."
 
-    context_str = "\n\n---\n\n".join(contexts)
-    system_prompt = (
-        "You are an expert financial analyst chatbot. Your task is to answer the user's question based strictly on the provided financial document extracts.\n"
-        "Rules:\n"
-        "1. Ground all numbers, percentages, and statements in the extracts. Cite the exact Source document name.\n"
-        "2. If the document extracts do not contain the answer, say clearly that you do not have sufficient information in the loaded financial documents.\n"
-        "3. Do not speculate or extrapolate financial metrics beyond what is given.\n"
-        "4. Format tabular data or balance sheet extracts cleanly using markdown tables."
-    )
-    user_prompt = f"Financial Extracts:\n{context_str}\n\nQuestion: {query}"
-    
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.1
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"OpenAI error: {e}"
-
-# Global initialization: Reload existing BM25 indices on startup if files exist in storage
-# Since the server starts up memory:// by default, we fit the BM25 indices in RAM.
+# ============================================================================
+# MODELS
+# ============================================================================
 
 class ChatQuery(BaseModel):
     message: str
     collection: str = "finance_docs"
 
+
+# ============================================================================
+# HEALTH ENDPOINT
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for ALB. Returns 200 if service is ready."""
+    # Check RuVector connectivity
+    ruvector_status = "unknown"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{RUVECTOR_URL}/health", timeout=3.0)
+            ruvector_status = "healthy" if resp.status_code == 200 else "unhealthy"
+    except Exception:
+        ruvector_status = "unavailable"
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "healthy",
+            "service": "rag-app",
+            "ruvector": ruvector_status,
+            "embedding_provider": EMBEDDING_PROVIDER,
+            "llm_provider": LLM_PROVIDER
+        }
+    )
+
+
+# ============================================================================
+# DOCUMENT INGESTION - Streaming with progress tracking
+# ============================================================================
+
 @app.post("/ingest")
 async def ingest_document(file: UploadFile = File(...), collection: str = Form("finance_docs")):
+    """Upload and process documents up to 100 MB with streaming and progress tracking."""
     start_time = time.time()
     filename = file.filename
-    logger.info(f"Ingesting file: {filename} into collection: {collection}")
-    
-    # 1. Parse File Content
-    content = ""
-    try:
-        if filename.endswith(".pdf"):
-            reader = PdfReader(file.file)
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    content += text + "\n"
-        elif filename.endswith((".xlsx", ".xls")):
-            df_dict = pd.read_excel(file.file, sheet_name=None)
-            for sheet, df in df_dict.items():
-                content += f"\nSheet: {sheet}\n"
-                content += df.to_csv(index=False) + "\n"
-        elif filename.endswith(".csv"):
-            df = pd.read_csv(file.file)
-            content = df.to_csv(index=False)
-        else:
-            content_bytes = await file.read()
-            content = content_bytes.decode("utf-8", errors="ignore")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse document: {e}")
-        
-    if not content.strip():
-        raise HTTPException(status_code=400, detail="Document content is empty.")
-        
-    # 2. Intelligent financial chunking
-    chunker = SmartFinancialChunker(chunk_size=700, overlap=120)
-    chunks = chunker.chunk_document(content, filename)
-    logger.info(f"Generated {len(chunks)} chunks using Smart Financial Chunker.")
-    
-    # 3. Fit/Update Local Sparse BM25 Index for this collection
-    if collection not in bm25_indices:
-        bm25_indices[collection] = SimpleBM25()
-        
-    # Merge existing chunks in BM25 with new ones
-    all_collection_chunks = bm25_indices[collection].documents_metadata + chunks
-    bm25_indices[collection].fit(all_collection_chunks)
-    logger.info(f"Updated local BM25 index. Total corpus size: {len(all_collection_chunks)} chunks.")
+    job_id = str(uuid.uuid4())
+    request_id = job_id[:8]
 
-    # 4. Create collection in RuVector (auto-create if missing)
-    dim = get_vector_dimension()
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(f"{RUVECTOR_URL}/collections", json={
-                "name": collection,
-                "dimension": dim,
-                "metric": "Cosine"
-            }, timeout=5.0)
-        except Exception as e:
-            logger.warning(f"Could not contact RuVector server to auto-create collection: {e}")
-            
-    # 5. Generate embeddings and upload to RuVector DB
-    vector_entries = []
-    for idx, chunk in enumerate(chunks):
-        try:
-            vector = get_embedding(chunk["text"])
-            meta = chunk["metadata"]
-            meta["text"] = chunk["text"]  # Persistent storage of text in metadata
-            vector_entries.append({
-                "id": f"{filename}_{idx}_{int(time.time())}",
-                "vector": vector,
-                "metadata": meta
-            })
-        except Exception as e:
-            logger.error(f"Error embedding chunk {idx}: {e}")
-            
-    # Send points to RuVector
-    inserted_count = 0
-    if vector_entries:
-        try:
-            async with httpx.AsyncClient() as client:
-                url = f"{RUVECTOR_URL}/collections/{collection}/points"
-                response = await client.put(url, json={"points": vector_entries}, timeout=30.0)
-                if response.status_code == 200:
-                    inserted_count = len(vector_entries)
-                    logger.info(f"Successfully upserted {inserted_count} dense points to RuVector.")
-                else:
-                    logger.error(f"RuVector upsert failed: {response.text}")
-                    raise HTTPException(status_code=500, detail=f"RuVector Server returned error: {response.text}")
-        except Exception as e:
-            logger.error(f"Failed to upload points to RuVector: {e}")
-            raise HTTPException(status_code=503, detail=f"RuVector Server is not responding. Details: {e}")
-            
-    elapsed = time.time() - start_time
-    return {
-        "status": "success",
+    logger.info(f"Ingestion started: {filename} -> collection={collection}", extra={'request_id': request_id})
+
+    # Initialize job status
+    ingestion_jobs[job_id] = {
+        "job_id": job_id,
         "filename": filename,
-        "chunks": len(chunks),
-        "inserted_points": inserted_count,
-        "elapsed_seconds": round(elapsed, 2)
+        "status": "processing",
+        "progress_pct": 0,
+        "total_pages": 0,
+        "processed_pages": 0,
+        "chunks_created": 0,
+        "error": None
     }
+
+    try:
+        # Stream file to temp storage in chunks (max 10 MB in memory at once)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}")
+        total_size = 0
+        chunk_size = 10 * 1024 * 1024  # 10 MB
+
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > MAX_UPLOAD_SIZE:
+                temp_file.close()
+                os.unlink(temp_file.name)
+                ingestion_jobs[job_id]["status"] = "failed"
+                ingestion_jobs[job_id]["error"] = "File exceeds 100 MB limit"
+                raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 100 MB")
+            temp_file.write(chunk)
+
+        temp_file.close()
+        logger.info(f"File streamed to disk: {total_size} bytes", extra={'request_id': request_id})
+
+        # Parse file content
+        content = ""
+        try:
+            if filename.endswith(".pdf"):
+                reader = PdfReader(temp_file.name)
+                total_pages = len(reader.pages)
+                ingestion_jobs[job_id]["total_pages"] = total_pages
+                for i, page in enumerate(reader.pages):
+                    text = page.extract_text()
+                    if text:
+                        content += text + "\n"
+                    ingestion_jobs[job_id]["processed_pages"] = i + 1
+                    ingestion_jobs[job_id]["progress_pct"] = int(((i + 1) / total_pages) * 50)
+            elif filename.endswith((".xlsx", ".xls")):
+                df_dict = pd.read_excel(temp_file.name, sheet_name=None)
+                total_sheets = len(df_dict)
+                ingestion_jobs[job_id]["total_pages"] = total_sheets
+                for i, (sheet, df) in enumerate(df_dict.items()):
+                    content += f"\nSheet: {sheet}\n"
+                    content += df.to_csv(index=False) + "\n"
+                    ingestion_jobs[job_id]["processed_pages"] = i + 1
+                    ingestion_jobs[job_id]["progress_pct"] = int(((i + 1) / total_sheets) * 50)
+            elif filename.endswith(".csv"):
+                df = pd.read_csv(temp_file.name)
+                content = df.to_csv(index=False)
+                ingestion_jobs[job_id]["total_pages"] = 1
+                ingestion_jobs[job_id]["processed_pages"] = 1
+                ingestion_jobs[job_id]["progress_pct"] = 50
+            else:
+                with open(temp_file.name, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                ingestion_jobs[job_id]["progress_pct"] = 50
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse document: {e}")
+        finally:
+            os.unlink(temp_file.name)
+
+        if not content.strip():
+            ingestion_jobs[job_id]["status"] = "failed"
+            ingestion_jobs[job_id]["error"] = "Document content is empty"
+            raise HTTPException(status_code=400, detail="Document content is empty.")
+
+        # Chunking
+        chunker = SmartFinancialChunker(chunk_size=700, overlap=120)
+        chunks = chunker.chunk_document(content, filename)
+        logger.info(f"Generated {len(chunks)} chunks", extra={'request_id': request_id})
+        ingestion_jobs[job_id]["progress_pct"] = 60
+
+        # Update BM25 index
+        if collection not in bm25_indices:
+            bm25_indices[collection] = SimpleBM25()
+        all_chunks = bm25_indices[collection].documents_metadata + chunks
+        bm25_indices[collection].fit(all_chunks)
+
+        # Create collection in RuVector
+        dim = get_vector_dimension()
+        async with httpx.AsyncClient() as client:
+            try:
+                await client.post(f"{RUVECTOR_URL}/collections", json={
+                    "name": collection, "dimension": dim, "metric": "Cosine"
+                }, timeout=5.0)
+            except Exception as e:
+                logger.warning(f"Could not create collection: {e}", extra={'request_id': request_id})
+
+        # Generate embeddings and upload vectors
+        vector_entries = []
+        total_chunks = len(chunks)
+        for idx, chunk in enumerate(chunks):
+            try:
+                vector = get_embedding(chunk["text"])
+                meta = chunk["metadata"]
+                meta["text"] = chunk["text"]
+                vector_entries.append({
+                    "id": f"{filename}_{idx}_{int(time.time())}",
+                    "vector": vector,
+                    "metadata": meta
+                })
+            except Exception as e:
+                logger.error(f"Embedding chunk {idx} failed: {e}", extra={'request_id': request_id})
+
+            # Update progress (60-95% range)
+            ingestion_jobs[job_id]["progress_pct"] = 60 + int((idx + 1) / total_chunks * 35)
+            ingestion_jobs[job_id]["chunks_created"] = len(vector_entries)
+
+        # Upsert to RuVector
+        inserted_count = 0
+        if vector_entries:
+            try:
+                async with httpx.AsyncClient() as client:
+                    url = f"{RUVECTOR_URL}/collections/{collection}/points"
+                    response = await client.put(url, json={"points": vector_entries}, timeout=30.0)
+                    if response.status_code == 200:
+                        inserted_count = len(vector_entries)
+                        logger.info(f"Upserted {inserted_count} vectors", extra={'request_id': request_id})
+                    else:
+                        # Rollback: remove partial vectors on failure
+                        logger.error(f"RuVector upsert failed: {response.text}", extra={'request_id': request_id})
+                        ingestion_jobs[job_id]["status"] = "failed"
+                        ingestion_jobs[job_id]["error"] = f"Vector storage failed: {response.text}"
+                        raise HTTPException(status_code=500, detail=f"RuVector error: {response.text}")
+            except HTTPException:
+                raise
+            except Exception as e:
+                ingestion_jobs[job_id]["status"] = "failed"
+                ingestion_jobs[job_id]["error"] = str(e)
+                raise HTTPException(status_code=503, detail=f"RuVector unavailable: {e}")
+
+        # Success
+        ingestion_jobs[job_id]["status"] = "completed"
+        ingestion_jobs[job_id]["progress_pct"] = 100
+        ingestion_jobs[job_id]["chunks_created"] = inserted_count
+
+        elapsed = time.time() - start_time
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "filename": filename,
+            "chunks": len(chunks),
+            "inserted_points": inserted_count,
+            "elapsed_seconds": round(elapsed, 2)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        ingestion_jobs[job_id]["status"] = "failed"
+        ingestion_jobs[job_id]["error"] = str(e)
+        logger.error(f"Ingestion failed: {e}", extra={'request_id': request_id})
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {e}")
+
+
+@app.get("/ingest/status/{job_id}")
+async def get_ingestion_status(job_id: str):
+    """Poll ingestion progress by job ID."""
+    if job_id not in ingestion_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return ingestion_jobs[job_id]
+
+
+# ============================================================================
+# CHAT ENDPOINT
+# ============================================================================
 
 @app.post("/chat")
 async def chat(query: ChatQuery):
     start_time = time.time()
     message = query.message
     collection = query.collection
-    
-    # --- 1. RUN INPUT GUARDRAIL ---
+    request_id = str(uuid.uuid4())[:8]
+
+    # Input guardrail
     guardrail_violation = run_input_guardrail(message)
     if guardrail_violation:
-        logger.warning(f"Input guardrail blocked query: '{message}'")
+        logger.warning(f"Input guardrail blocked: '{message}'", extra={'request_id': request_id})
         return {
             "response": guardrail_violation,
             "citations": [],
             "elapsed_ms": round((time.time() - start_time) * 1000, 2)
         }
 
-    logger.info(f"Query passed input guardrail: '{message}' in collection: {collection}")
-    
-    # --- 2. RETRIEVAL (HYBRID DENSE + SPARSE) ---
-    
-    # A. Dense Vector Retrieval (from RuVector DB)
+    logger.info(f"Query: '{message}' collection={collection}", extra={'request_id': request_id})
+
+    # Dense retrieval from RuVector
     dense_results = []
     try:
         query_vector = get_embedding(message)
         async with httpx.AsyncClient() as client:
             url = f"{RUVECTOR_URL}/collections/{collection}/points/search"
-            payload = {
-                "vector": query_vector,
-                "k": 20,  # Retrieve top 20 candidates
-                "filter": None
-            }
+            payload = {"vector": query_vector, "k": 20, "filter": None}
             response = await client.post(url, json=payload, timeout=10.0)
             if response.status_code == 200:
-                search_data = response.json()
-                dense_results = search_data.get("results", [])
-                logger.info(f"Dense search retrieved {len(dense_results)} candidates.")
+                dense_results = response.json().get("results", [])
     except Exception as e:
-        logger.error(f"Failed dense search against RuVector: {e}")
-        
-    # B. Sparse Keyword Retrieval (from Local BM25 Index)
+        logger.error(f"Dense search failed: {e}", extra={'request_id': request_id})
+
+    # Sparse retrieval from BM25
     sparse_results = []
     if collection in bm25_indices:
         try:
             raw_sparse = bm25_indices[collection].search(message, top_k=20)
-            # Reformat to match SearchResult schema
             for idx, r in enumerate(raw_sparse):
                 sparse_results.append({
                     "id": f"sparse_{idx}_{int(time.time())}",
                     "score": r["sparse_score"],
                     "metadata": r["metadata"]
                 })
-            logger.info(f"Sparse search retrieved {len(sparse_results)} candidates.")
         except Exception as e:
-            logger.error(f"Failed sparse search: {e}")
+            logger.error(f"Sparse search failed: {e}", extra={'request_id': request_id})
 
-    # C. Blend lists using Reciprocal Rank Fusion (RRF)
+    # Hybrid fusion
     hybrid_results = reciprocal_rank_fusion(dense_results, sparse_results)
-    logger.info(f"Hybrid retrieval combined list: {len(hybrid_results)} unique candidates.")
 
     if not hybrid_results:
         return {
-            "response": "No financial documents have been ingested yet. Please upload your corporate files (PDF/CSV/Excel) using the side panel to begin!",
+            "response": "No financial documents have been ingested yet. Please upload your corporate files using the side panel.",
             "citations": [],
             "elapsed_ms": round((time.time() - start_time) * 1000, 2)
         }
-        
-    # --- 3. LOCAL ZERO-COST RERANKING ---
-    pairs = []
+
+    # Extract text from results
     documents_metadata = []
-    
     for r in hybrid_results:
         meta = r.get("metadata", {}) or {}
         text = meta.get("text", "")
         if not text:
             continue
-        
-        pairs.append([message, text])
         documents_metadata.append({
             "id": r.get("id"),
             "text": text,
             "source": meta.get("source", "Unknown Document"),
             "type": meta.get("type", "prose"),
-            "header": meta.get("header", "")
+            "header": meta.get("header", ""),
+            "rrf_score": r.get("rrf_score", 0.0)
         })
-        
-    if not pairs:
+
+    if not documents_metadata:
         return {
-            "response": "Retrieve matching text was empty. Please re-upload your files.",
+            "response": "Retrieved text was empty. Please re-upload your files.",
             "citations": [],
             "elapsed_ms": round((time.time() - start_time) * 1000, 2)
         }
-        
-    # Calculate cross-encoder scores locally on CPU
-    rerank_scores = local_reranker.predict(pairs)
-    for idx, score in enumerate(rerank_scores):
-        documents_metadata[idx]["rerank_score"] = float(score)
-        
-    # Sort descending by rerank score
-    documents_metadata.sort(key=lambda x: x["rerank_score"], reverse=True)
+
     top_chunks = documents_metadata[:4]
-    
-    # --- 4. CONTEXT SCORE GATE GUARDRAIL ---
-    top_score = top_chunks[0]["rerank_score"] if top_chunks else -100.0
-    logger.info(f"Rerank validation - Top match score: {top_score}")
-    
-    if not run_context_gate_guardrail(top_score):
-        logger.warning(f"Context gate blocked prompt. Score {top_score} falls below threshold. Bypassed Bedrock API call.")
+
+    # Context score gate - skip LLM call if relevance too low (saves Bedrock costs)
+    top_score = top_chunks[0]["rrf_score"] if top_chunks else 0.0
+    MIN_RRF_THRESHOLD = 0.01
+
+    if top_score < MIN_RRF_THRESHOLD:
+        logger.warning(f"Context gate: RRF score {top_score} below threshold, skipping LLM", extra={'request_id': request_id})
         return {
-            "response": "Information Guardrail: Based on a comprehensive semantic and keyword check of all ingested documents, I could not locate any matching facts or numbers that answer your question. I declined calling the model to prevent hallucinated numbers.",
+            "response": "Information Guardrail: Could not locate matching facts in ingested documents. LLM call skipped to prevent hallucination.",
             "citations": [],
             "elapsed_ms": round((time.time() - start_time) * 1000, 2)
         }
-        
-    # --- 5. LLM GENERATION (BEDROCK CLAUDE 3.5 HAIKU / OPENAI) ---
+
+    # LLM Generation
     contexts = [c["text"] for c in top_chunks]
-    
-    # Call appropriate LLM
+
     if LLM_PROVIDER == "bedrock" and bedrock_client:
         raw_response = call_bedrock_haiku(message, contexts)
-    elif LLM_PROVIDER == "openai" and openai_client:
-        raw_response = call_openai_mini(message, contexts)
     else:
-        # Fallback offline mock response
         raw_response = (
-            f"**[FREE LOCAL MODE - NO Bedrock/OpenAI Credentials Configured]**\n\n"
-            f"Here are the exact matching extracts found in the database:\n\n"
-            + "\n\n---\n\n".join(contexts)
+            f"**[MOCK MODE - No Bedrock]**\n\n"
+            f"Matching extracts:\n\n" + "\n\n---\n\n".join(contexts)
         )
-        
-    # --- 6. RUN OUTPUT GUARDRAIL ---
+
+    # Output guardrail
     guarded_response = run_output_guardrail(raw_response, contexts)
-    
-    # Prepare citations
+
     citations = []
     for c in top_chunks:
         citations.append({
@@ -534,13 +593,18 @@ async def chat(query: ChatQuery):
             "header": c["header"],
             "snippet": c["text"][:300] + "..." if len(c["text"]) > 300 else c["text"]
         })
-        
+
     elapsed = (time.time() - start_time) * 1000
     return {
         "response": guarded_response,
         "citations": citations,
         "elapsed_ms": round(elapsed, 2)
     }
+
+
+# ============================================================================
+# COLLECTION MANAGEMENT
+# ============================================================================
 
 @app.get("/collections")
 async def list_collections():
@@ -551,36 +615,37 @@ async def list_collections():
                 return response.json()
             return {"collections": []}
     except Exception as e:
-        logger.error(f"Failed to list collections from RuVector: {e}")
-        return {"collections": ["finance_docs"]}
+        logger.error(f"Failed to list collections: {e}", extra={'request_id': 'collections'})
+        return {"collections": []}
+
 
 @app.post("/collections/clear")
 async def clear_collection(collection: str = Form("finance_docs")):
     try:
-        # Clear local BM25 index
         if collection in bm25_indices:
             bm25_indices[collection] = SimpleBM25()
-            logger.info(f"Cleared local BM25 index for collection '{collection}'.")
-            
+
         async with httpx.AsyncClient() as client:
             await client.delete(f"{RUVECTOR_URL}/collections/{collection}", timeout=5.0)
             dim = get_vector_dimension()
             await client.post(f"{RUVECTOR_URL}/collections", json={
-                "name": collection,
-                "dimension": dim,
-                "metric": "Cosine"
+                "name": collection, "dimension": dim, "metric": "Cosine"
             }, timeout=5.0)
             return {"status": "success", "message": f"Collection '{collection}' cleared."}
     except Exception as e:
-        logger.error(f"Failed to clear collection: {e}")
+        logger.error(f"Failed to clear collection: {e}", extra={'request_id': 'clear'})
         raise HTTPException(status_code=500, detail=f"Failed to clear collection: {e}")
 
-# Serve UI
+
+# ============================================================================
+# STATIC FRONTEND
+# ============================================================================
 frontend_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
 if os.path.exists(frontend_dir):
     app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
-    logger.info(f"Serving static frontend from: {frontend_dir}")
+    logger.info(f"Serving frontend from: {frontend_dir}", extra={'request_id': 'startup'})
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+

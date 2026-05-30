@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -7,10 +8,12 @@
     <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap"
+        rel="stylesheet">
     <!-- FontAwesome for Premium Icons -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    
+
     <style>
         /* CSS Variables - Premium HSL Color Palette & Glassmorphic Tokens */
         :root {
@@ -19,23 +22,23 @@
             --bg-card-hover: rgba(23, 33, 53, 0.8);
             --border-glow: rgba(255, 255, 255, 0.08);
             --border-glow-active: rgba(6, 182, 212, 0.3);
-            
+
             --text-primary: #f3f4f6;
             --text-secondary: #9ca3af;
             --text-muted: #6b7280;
-            
+
             --accent-cyan: #06b6d4;
             --accent-violet: #8b5cf6;
             --accent-magenta: #d946ef;
             --accent-green: #10b981;
             --accent-red: #ef4444;
-            
+
             --glow-cyan: rgba(6, 182, 212, 0.15);
             --glow-violet: rgba(139, 92, 246, 0.15);
-            
+
             --font-display: 'Outfit', 'Inter', sans-serif;
             --font-body: 'Inter', sans-serif;
-            
+
             --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             --shadow-premium: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
         }
@@ -56,7 +59,7 @@
             display: flex;
             flex-direction: column;
             overflow-x: hidden;
-            background-image: 
+            background-image:
                 radial-gradient(at 10% 20%, rgba(6, 182, 212, 0.08) 0px, transparent 50%),
                 radial-gradient(at 90% 80%, rgba(139, 92, 246, 0.08) 0px, transparent 50%);
         }
@@ -606,7 +609,8 @@
             border-radius: 12px;
             border: 1px solid var(--border-glow);
             white-space: pre-wrap;
-            font-family: 'Courier New', Courier, monospace; /* Perfect for table structures */
+            font-family: 'Courier New', Courier, monospace;
+            /* Perfect for table structures */
         }
 
         /* Animations */
@@ -614,9 +618,11 @@
             0% {
                 box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4);
             }
+
             70% {
                 box-shadow: 0 0 0 10px rgba(16, 185, 129, 0);
             }
+
             100% {
                 box-shadow: 0 0 0 0 rgba(16, 185, 129, 0);
             }
@@ -630,7 +636,8 @@
             font-size: 0.85rem;
         }
 
-        table th, table td {
+        table th,
+        table td {
             padding: 0.5rem 0.75rem;
             border: 1px solid rgba(255, 255, 255, 0.08);
             text-align: left;
@@ -647,6 +654,7 @@
         }
     </style>
 </head>
+
 <body>
 
     <!-- Header -->
@@ -665,7 +673,7 @@
     <div class="container">
         <!-- Left Sidebar: Controls & Ingestion -->
         <aside class="sidebar">
-            
+
             <!-- Ingest Box -->
             <div class="sidebar-widget">
                 <div class="widget-title">
@@ -678,9 +686,10 @@
                     <span>PDF, CSV, Excel, or TXT</span>
                     <input type="file" id="file-input" accept=".pdf,.csv,.xlsx,.xls,.txt">
                 </div>
-                
+
                 <div class="upload-progress" id="upload-progress">
-                    <span style="font-size: 0.75rem; color: var(--text-secondary);" id="upload-status-label">Ingesting...</span>
+                    <span style="font-size: 0.75rem; color: var(--text-secondary);"
+                        id="upload-status-label">Ingesting...</span>
                     <div class="progress-bar-container">
                         <div class="progress-bar" id="progress-indicator"></div>
                     </div>
@@ -696,7 +705,8 @@
                 <ul class="info-list">
                     <li>Database engine: <span>Rust HNSW</span></li>
                     <li>REST Server URL: <span style="font-size: 0.75rem;">http://ruvector:6333</span></li>
-                    <li>Status: <span id="db-status-badge" style="color: var(--accent-red); font-weight: bold;">Offline</span></li>
+                    <li>Status: <span id="db-status-badge"
+                            style="color: var(--accent-red); font-weight: bold;">Offline</span></li>
                     <li>Index Type: <span>Cosine HNSW</span></li>
                 </ul>
             </div>
@@ -707,6 +717,10 @@
                     <i class="fa-solid fa-gears"></i>
                     <h2>System Control</h2>
                 </div>
+                <button class="btn" style="margin-bottom: 0.75rem;" onclick="startNewChat()">
+                    <i class="fa-solid fa-plus"></i>
+                    New Chat Session
+                </button>
                 <button class="btn btn-danger" onclick="clearCollection()">
                     <i class="fa-solid fa-trash-can"></i>
                     Reset Database
@@ -717,7 +731,7 @@
 
         <!-- Main Chat Area -->
         <main class="chat-area">
-            
+
             <!-- Chat Timeline -->
             <div class="messages-timeline" id="chat-timeline">
                 <!-- Welcome Screen -->
@@ -727,10 +741,13 @@
                     </div>
                     <h2>Cost-Efficient Financial RAG</h2>
                     <p>
-                        A smarter, faster, and highly accurate financial query system. Upload balance sheets, income statements, or financial prospectuses, and extract precision data backed by <strong>RuVector HNSW</strong> and local cross-encoder re-ranking.
+                        A smarter, faster, and highly accurate financial query system. Upload balance sheets, income
+                        statements, or financial prospectuses, and extract precision data backed by <strong>RuVector
+                            HNSW</strong> and local cross-encoder re-ranking.
                     </p>
                     <div style="width: 100%; display: flex; justify-content: center; gap: 1rem;">
-                        <button class="btn" style="max-width: 200px;" onclick="document.getElementById('file-input').click()">
+                        <button class="btn" style="max-width: 200px;"
+                            onclick="document.getElementById('file-input').click()">
                             <i class="fa-solid fa-file-arrow-up"></i> Ingest Document
                         </button>
                     </div>
@@ -740,7 +757,9 @@
             <!-- Chat Input Bar -->
             <div class="chat-input-wrapper">
                 <div class="chat-input-bar">
-                    <textarea id="user-input" placeholder="Ask a financial question (e.g. What is the net revenue for FY24?)..." onkeydown="handleKeyDown(event)"></textarea>
+                    <textarea id="user-input"
+                        placeholder="Ask a financial question (e.g. What is the net revenue for FY24?)..."
+                        onkeydown="handleKeyDown(event)"></textarea>
                     <button class="send-circle" onclick="sendChat()" id="send-button">
                         <i class="fa-solid fa-paper-plane"></i>
                     </button>
@@ -767,16 +786,81 @@
     <!-- JS Logic -->
     <script>
         const API_BASE = window.location.origin; // Same-host unified deployment
+        const SESSION_STORAGE_KEY = 'rag_chat_session';
         let isProcessing = false;
 
-        // On Load: Health check VectorDB & Init UI
+        // ============================================================
+        // SESSION PERSISTENCE - Survives page reloads
+        // ============================================================
+        function getSession() {
+            try {
+                const data = localStorage.getItem(SESSION_STORAGE_KEY);
+                if (data) return JSON.parse(data);
+            } catch (e) {
+                console.warn('Failed to load session:', e);
+            }
+            return { messages: [], created: Date.now() };
+        }
+
+        function saveSession() {
+            try {
+                const timeline = document.getElementById('chat-timeline');
+                const messages = [];
+                timeline.querySelectorAll('[data-persist]').forEach(el => {
+                    messages.push({
+                        type: el.dataset.persist,  // 'user', 'bot', 'system'
+                        text: el.dataset.text || '',
+                        citations: el.dataset.citations ? JSON.parse(el.dataset.citations) : [],
+                        timestamp: el.dataset.timestamp || Date.now()
+                    });
+                });
+                localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+                    messages,
+                    created: getSession().created || Date.now()
+                }));
+            } catch (e) {
+                console.warn('Failed to save session:', e);
+            }
+        }
+
+        function clearSession() {
+            localStorage.removeItem(SESSION_STORAGE_KEY);
+        }
+
+        function restoreSession() {
+            const session = getSession();
+            if (session.messages.length === 0) return;
+
+            // Hide welcome screen
+            const welcome = document.getElementById('welcome-screen');
+            if (welcome) welcome.remove();
+
+            session.messages.forEach(msg => {
+                if (msg.type === 'system') {
+                    addSystemMessage(msg.text, false); // false = don't save again
+                } else if (msg.type === 'user') {
+                    appendMessage(msg.text, 'user', false, false); // don't save
+                } else if (msg.type === 'bot') {
+                    const id = appendMessage(msg.text, 'bot', false, false);
+                    if (msg.citations && msg.citations.length > 0) {
+                        updateBotMessage(id, msg.text, msg.citations, false);
+                    }
+                }
+            });
+        }
+
+        function startNewChat() {
+            if (!confirm('Start a new chat session? Current conversation will be cleared.')) return;
+            clearSession();
+            location.reload();
+        }
+
+        // On Load: Health check VectorDB & Init UI & Restore Session
         window.addEventListener('DOMContentLoaded', () => {
             checkDatabaseHealth();
-            // Perform health check every 10 seconds
             setInterval(checkDatabaseHealth, 10000);
-            
-            // Set up file input trigger
             document.getElementById('file-input').addEventListener('change', uploadFile);
+            restoreSession();
         });
 
         // Health Check
@@ -798,7 +882,7 @@
             const statusDot = document.getElementById('status-dot');
             const statusText = document.getElementById('status-text');
             const dbBadge = document.getElementById('db-status-badge');
-            
+
             if (isOnline) {
                 statusDot.classList.add('online');
                 statusText.innerText = "VectorDB Online";
@@ -820,7 +904,7 @@
             const progressZone = document.getElementById('upload-progress');
             const statusLabel = document.getElementById('upload-status-label');
             const indicator = document.getElementById('progress-indicator');
-            
+
             progressZone.style.display = 'block';
             statusLabel.innerText = `Reading '${file.name}'...`;
             indicator.style.width = '20%';
@@ -832,7 +916,7 @@
             try {
                 indicator.style.width = '50%';
                 statusLabel.innerText = "Chunking & generating embeddings...";
-                
+
                 const response = await fetch(`${API_BASE}/ingest`, {
                     method: 'POST',
                     body: formData
@@ -842,10 +926,10 @@
                     const result = await response.json();
                     indicator.style.width = '100%';
                     statusLabel.innerText = `Loaded ${result.chunks} chunks successfully!`;
-                    
+
                     // Add message in chat timeline about successful ingestion
                     addSystemMessage(`Successfully ingested document **${result.filename}** (${result.chunks} chunks loaded to RuVector HNSW in ${result.elapsed_seconds}s). You can now ask questions about it!`);
-                    
+
                     setTimeout(() => {
                         progressZone.style.display = 'none';
                         indicator.style.width = '0%';
@@ -885,15 +969,15 @@
             // Append User message
             appendMessage(queryText, 'user');
             inputField.value = '';
-            
+
             // Set Loading state
             isProcessing = true;
             const botMessageId = appendMessage('<i class="fa-solid fa-circle-notch fa-spin"></i> Processing financial extracts and reranking...', 'bot', true);
-            
+
             try {
                 const response = await fetch(`${API_BASE}/chat`, {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: { 'Content-Type': 'application/json' },
                     body: jsonStr = JSON.stringify({
                         message: queryText,
                         collection: 'finance_docs'
@@ -917,28 +1001,36 @@
 
         let messageCounter = 0;
 
-        function appendMessage(text, sender, isRawHtml = false) {
+        function appendMessage(text, sender, isRawHtml = false, persist = true) {
             messageCounter++;
             const id = `msg-${messageCounter}`;
             const timeline = document.getElementById('chat-timeline');
-            
+
             const row = document.createElement('div');
             row.className = `message-row ${sender}`;
             row.id = id;
-            
+
+            // Persistence data attributes
+            if (persist && !isRawHtml) {
+                row.dataset.persist = sender;
+                row.dataset.text = text;
+                row.dataset.citations = '[]';
+                row.dataset.timestamp = Date.now();
+            }
+
             const avatar = document.createElement('div');
             avatar.className = 'avatar';
             avatar.innerHTML = sender === 'user' ? '<i class="fa-solid fa-user-tie"></i>' : '<i class="fa-solid fa-brain"></i>';
-            
+
             const bubble = document.createElement('div');
             bubble.className = 'bubble';
-            
+
             if (isRawHtml) {
                 bubble.innerHTML = text;
             } else {
                 bubble.innerHTML = parseMarkdown(text);
             }
-            
+
             if (sender === 'user') {
                 row.appendChild(bubble);
                 row.appendChild(avatar);
@@ -946,13 +1038,15 @@
                 row.appendChild(avatar);
                 row.appendChild(bubble);
             }
-            
+
             timeline.appendChild(row);
             timeline.scrollTop = timeline.scrollHeight;
+
+            if (persist && !isRawHtml) saveSession();
             return id;
         }
 
-        function addSystemMessage(text) {
+        function addSystemMessage(text, persist = true) {
             const timeline = document.getElementById('chat-timeline');
             const sysBox = document.createElement('div');
             sysBox.style.margin = '1rem 0';
@@ -964,31 +1058,48 @@
             sysBox.style.fontSize = '0.85rem';
             sysBox.style.textAlign = 'center';
             sysBox.innerHTML = `<i class="fa-solid fa-circle-info" style="color: var(--accent-cyan); margin-right: 0.5rem;"></i> ${parseMarkdown(text)}`;
-            
+
+            // Persistence
+            if (persist) {
+                sysBox.dataset.persist = 'system';
+                sysBox.dataset.text = text;
+                sysBox.dataset.timestamp = Date.now();
+            }
+
             // Remove welcome screen if visible
             const welcome = document.getElementById('welcome-screen');
             if (welcome) welcome.remove();
-            
+
             timeline.appendChild(sysBox);
             timeline.scrollTop = timeline.scrollHeight;
+
+            if (persist) saveSession();
         }
 
-        function updateBotMessage(messageId, text, citations = []) {
+        function updateBotMessage(messageId, text, citations = [], persist = true) {
             const messageRow = document.getElementById(messageId);
             if (!messageRow) return;
-            
+
             const bubble = messageRow.querySelector('.bubble');
             bubble.innerHTML = parseMarkdown(text);
-            
+
+            // Update persistence data
+            if (persist) {
+                messageRow.dataset.persist = 'bot';
+                messageRow.dataset.text = text;
+                messageRow.dataset.citations = JSON.stringify(citations);
+                messageRow.dataset.timestamp = Date.now();
+            }
+
             if (citations && citations.length > 0) {
                 const citeContainer = document.createElement('div');
                 citeContainer.className = 'citations-container';
-                
+
                 const header = document.createElement('div');
                 header.className = 'citations-header';
                 header.innerHTML = '<i class="fa-solid fa-square-check"></i> Grounded Citations';
                 citeContainer.appendChild(header);
-                
+
                 citations.forEach((c, idx) => {
                     const tag = document.createElement('div');
                     tag.className = 'citation-tag';
@@ -996,12 +1107,14 @@
                     tag.onclick = () => showCitationDetails(c);
                     citeContainer.appendChild(tag);
                 });
-                
+
                 bubble.appendChild(citeContainer);
             }
-            
+
             const timeline = document.getElementById('chat-timeline');
             timeline.scrollTop = timeline.scrollHeight;
+
+            if (persist) saveSession();
         }
 
         // Citation Drawer Exploration
@@ -1023,16 +1136,16 @@
         // Reset database
         async function clearCollection() {
             if (!confirm("Are you sure you want to clear the entire financial database? All document chunks and HNSW indexes will be wiped.")) return;
-            
+
             try {
                 const formData = new FormData();
                 formData.append('collection', 'finance_docs');
-                
+
                 const response = await fetch(`${API_BASE}/collections/clear`, {
                     method: 'POST',
                     body: formData
                 });
-                
+
                 if (response.ok) {
                     addSystemMessage("Financial database collections successfully cleared and reset.");
                 } else {
@@ -1047,31 +1160,31 @@
         // Minimalist parser for Markdown tables and lists in chatbot bubble
         function parseMarkdown(text) {
             if (!text) return "";
-            
+
             // Clean HTML tags first for XSS safety
             let clean = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-            
+
             // Bold
             clean = clean.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-            
+
             // Inline Code
             clean = clean.replace(/`(.*?)`/g, '<code>$1</code>');
-            
+
             // Bullets
             clean = clean.replace(/^\s*[-*]\s+(.*)$/gm, '<li>$1</li>');
             clean = clean.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
-            
+
             // Markdown tables (detect pipe structure)
             const lines = clean.split('\n');
             let inTable = false;
             let tableHtml = '<table>';
-            
+
             for (let i = 0; i < lines.length; i++) {
                 const line = lines[i].trim();
-                
+
                 if (line.startsWith('|') && line.endsWith('|')) {
                     const cells = line.split('|').map(c => c.trim()).filter((_, idx, arr) => idx > 0 && idx < arr.length - 1);
-                    
+
                     if (!inTable) {
                         inTable = true;
                         tableHtml += '<thead><tr>';
@@ -1096,13 +1209,14 @@
                     }
                 }
             }
-            
+
             // Reassemble lines
             const processed = lines.filter(l => l !== "").join('\n');
-            
+
             // Newlines to br
             return processed.replace(/\n/g, '<br>');
         }
     </script>
 </body>
+
 </html>
