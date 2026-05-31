@@ -1,0 +1,20 @@
+# Pull latest code
+cd /home/ubuntu/rag_app
+sudo git pull
+
+# Rebuild image and restart container
+sudo docker build -t rag-chatbot -f Dockerfile .
+sudo docker stop rag-chatbot && sudo docker rm rag-chatbot
+sudo docker run -d \
+  --name rag-chatbot \
+  --restart unless-stopped \
+  --network host \
+  -e RUVECTOR_URL="http://10.0.1.225:6333" \
+  -e EMBEDDING_PROVIDER="bedrock" \
+  -e LLM_PROVIDER="bedrock" \
+  -e AWS_REGION="us-east-1" \
+  -e AWS_DEFAULT_REGION="us-east-1" \
+  rag-chatbot
+
+# Verify
+sleep 10 && curl http://localhost:8000/health

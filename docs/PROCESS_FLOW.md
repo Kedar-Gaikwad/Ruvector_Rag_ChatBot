@@ -1,486 +1,313 @@
 # Process Flow — RuVector RAG ChatBot
 
-This document describes the end-to-end request lifecycle for all major operations in the system: health checks, document ingestion, chat queries, and error handling flows.
-
----
-
-## Table of Contents
-
-1. [Health Check Flow](#1-health-check-flow)
-2. [Document Ingestion Flow](#2-document-ingestion-flow)
-3. [Chat Query Flow](#3-chat-query-flow)
-4. [Guardrail Decision Flow](#4-guardrail-decision-flow)
-5. [Spot Instance Interruption Flow](#5-spot-instance-interruption-flow)
-6. [Error Handling Flows](#6-error-handling-flows)
-7. [Session Persistence Flow](#7-session-persistence-flow)
-
 ---
 
 ## 1. Health Check Flow
 
-The ALB performs health checks every 30 seconds to determine if the RAG App can serve traffic.
-
 ```
-ALB                          RAG App                       RuVector
- │                              │                              │
- │──GET /health────────────────▶│                              │
- │                              │──GET /health────────────────▶│
- │                              │◀─────────200 OK──────────────│
- │                              │                              │
- │◀────200 OK──────────────────-│                              │
- │  {                           │                              │
- │    "status": "healthy",      │                              │
- │    "ruvector": "healthy",    │                              │
- │    "embedding_provider":     │                              │
- │      "bedrock"               │                              │
- │  }                           │                              │
+ALB                    RAG App                  Qdrant          Bedrock
+ │                        │                        │               │
+ │──GET /health──────────▶│                        │               │
+ │                        │──GET /healthz─────────▶│               │
+ │                        │◀──200 OK───────────────│               │
+ │                        │                        │               │
+ │                        │──invoke_model("health")────────────────▶│
+ │                        │◀──embedding[1024]──────────────────────│
+ │                        │                        │               │
+ │◀──200 OK──────────────│                        │               │
+ │  {                     │                        │               │
+ │    "status":"healthy", │                        │               │
+ │    "qdrant":"healthy", │                        │               │
+ │    "bedrock":"healthy (dim=1024)",              │               │
+ │    "ruvector_url":"http://10.0.x.x:6333"       │               │
+ │  }                     │                        │               │
 ```
 
-**Decision logic:**
-- RAG App always returns 200 if the process is running (even if RuVector is down)
-- The `ruvector` field indicates vector DB connectivity
-- ALB marks target healthy after 2 consecutive 200 responses
-- ALB marks target unhealthy after 3 consecutive failures (timeout or non-200)
+The health endpoint always returns HTTP 200 (so ALB never marks it unhealthy due to a Bedrock blip). Component status is in the body. The Bedrock check makes a real Titan Embed call — if it returns 1024 dimensions, the full pipeline is working.
+
+**Qdrant health path:** `/healthz` (Kubernetes liveness probe). Not `/health` — that returns a 404.
 
 ---
 
 ## 2. Document Ingestion Flow
 
-Large document processing with streaming, chunking, embedding, and vector storage.
+### 2a. Upload Phase (synchronous, fast)
 
 ```
-User Browser              RAG App                    Bedrock               RuVector
-     │                       │                          │                      │
-     │──POST /ingest─────────▶│                          │                      │
-     │  (multipart, ≤100MB)  │                          │                      │
-     │                       │                          │                      │
-     │                       │──[Stream to disk]────┐   │                      │
-     │                       │  (10 MB chunks)      │   │                      │
-     │                       │◀─────────────────────┘   │                      │
-     │                       │                          │                      │
-     │                       │──[Parse document]────┐   │                      │
-     │                       │  PDF/Excel/CSV        │   │                      │
-     │                       │  Track page progress  │   │                      │
-     │                       │◀─────────────────────┘   │                      │
-     │                       │                          │                      │
-     │                       │──[Smart Chunking]────┐   │                      │
-     │                       │  700 tokens, 120 overlap│  │                      │
-     │                       │  Preserve tables      │   │                      │
-     │                       │◀─────────────────────┘   │                      │
-     │                       │                          │                      │
-     │                       │──[Update BM25 Index]─┐   │                      │
-     │                       │◀─────────────────────┘   │                      │
-     │                       │                          │                      │
-     │                       │──POST /collections───────┼─────────────────────▶│
-     │                       │  (create if missing)     │                      │
-     │                       │◀─────────────────────────┼──────────────────────│
-     │                       │                          │                      │
-     │                       │  ┌─── FOR EACH CHUNK ────┐                      │
-     │                       │  │                       │                      │
-     │                       │──┼──InvokeModel──────────▶│                      │
-     │                       │  │  (Titan Embed v2)     │                      │
-     │                       │◀─┼──[1024-dim vector]────│                      │
-     │                       │  │                       │                      │
-     │                       │  │  progress_pct = 60 + (idx/total × 35)        │
-     │                       │  │                       │                      │
-     │                       │  └───────────────────────┘                      │
-     │                       │                          │                      │
-     │                       │──PUT /collections/{name}/points────────────────▶│
-     │                       │  (batch upsert all vectors)                     │
-     │                       │◀────────────200 OK──────────────────────────────│
-     │                       │                          │                      │
-     │◀──200 OK──────────────│                          │                      │
-     │  {                    │                          │                      │
-     │    "job_id": "...",   │                          │                      │
-     │    "chunks": 342,     │                          │                      │
-     │    "inserted_points": │                          │                      │
-     │      342              │                          │                      │
-     │  }                    │                          │                      │
+Browser              RAG App
+   │                    │
+   │──POST /ingest──────▶│
+   │  (multipart file)  │
+   │                    │──stream to temp file (10 MB chunks)
+   │                    │──register job_id, status="processing"
+   │◀──202 Accepted─────│
+   │  {                 │
+   │    "job_id":"...", │
+   │    "status":"accepted"
+   │  }                 │
 ```
 
-### Ingestion Progress Tracking
+Returns in < 1 second regardless of file size. No ALB timeout risk.
 
-The client can poll `GET /ingest/status/{job_id}` during processing:
+### 2b. Background Processing Phase
+
+```
+Background Task      PDF Extractor           Bedrock          Qdrant
+      │                    │                    │                │
+      │──extract_pdf()────▶│                    │                │
+      │                    │                    │                │
+      │  Layer 1: AcroForm fields               │                │
+      │  (reader.get_fields() — any page)       │                │
+      │                    │                    │                │
+      │  Layer 2: pypdf layout per page         │                │
+      │  (extraction_mode="layout")             │                │
+      │                    │                    │                │
+      │  Layer 3: Textract (if page < 50 chars) │                │
+      │  (AnalyzeDocument FORMS+TABLES)         │                │
+      │◀──(full_content, page_contents)─────────│                │
+      │                    │                    │                │
+      │──SmartFinancialChunker.chunk_document() │                │
+      │  ├─ is_form_document()? → chunk_page()  │                │
+      │  │   (per-page, every line kept)        │                │
+      │  └─ else → prose + table chunking       │                │
+      │                    │                    │                │
+      │──PUT /collections/{name}────────────────────────────────▶│
+      │  {"vectors":{"size":1024,"distance":"Cosine"}}           │
+      │◀──200/201──────────────────────────────────────────────── │
+      │                    │                    │                │
+      │  FOR EACH BATCH (10 chunks):            │                │
+      │  ├─ invoke_model(Titan Embed)──────────▶│                │
+      │  │◀──embedding[1024]──────────────────── │                │
+      │  │                                      │                │
+      │  └─ PUT /collections/{name}/points──────────────────────▶│
+      │     {"points":[{"id":uuid,"vector":[...],"payload":{}}]} │
+      │◀──200/201──────────────────────────────────────────────── │
+      │                    │                    │                │
+      │  progress_pct = 55 + (batch/total × 40) │                │
+```
+
+### 2c. Progress Polling
+
+```
+Browser              RAG App
+   │                    │
+   │──GET /ingest/status/{job_id}──▶│
+   │◀──{                            │
+   │     "status":"processing",     │
+   │     "progress_pct":72,         │
+   │     "chunks_created":34,       │
+   │     "total_pages":6            │
+   │   }                            │
+   │                    │
+   │  (poll every 5s until status="completed" or "failed")
+```
+
+### Progress Phases
 
 | Phase | Progress % | Description |
 |-------|-----------|-------------|
-| Streaming | 0% | File being received |
-| Parsing | 0-50% | Pages/sheets extracted |
-| Chunking | 50-60% | Smart financial chunking |
-| Embedding | 60-95% | Bedrock Titan calls per chunk |
-| Upserting | 95-100% | Vectors stored in RuVector |
-
-### Failure Rollback
-
-If the upsert to RuVector fails after partial embedding:
-1. Job status set to `"failed"` with error message
-2. Already-generated vectors are discarded (not sent to RuVector)
-3. BM25 index may be partially updated (ephemeral, not critical)
-4. Temp file is always cleaned up in `finally` block
+| Upload received | 5% | File streamed to disk |
+| PDF extraction | 5-45% | AcroForm + pypdf + Textract per page |
+| Chunking | 55% | SmartFinancialChunker |
+| Embedding + upsert | 55-95% | Bedrock Titan + Qdrant batches |
+| Complete | 100% | All chunks inserted |
 
 ---
 
 ## 3. Chat Query Flow
 
-The complete RAG pipeline from user question to grounded answer.
-
 ```
-User Browser              RAG App                    Bedrock               RuVector
-     │                       │                          │                      │
-     │──POST /chat───────────▶│                          │                      │
-     │  {"message": "...",   │                          │                      │
-     │   "collection": "..."}│                          │                      │
-     │                       │                          │                      │
-     │                       │──[INPUT GUARDRAIL]───┐   │                      │
-     │                       │  • Injection check    │   │                      │
-     │                       │  • Domain relevance   │   │                      │
-     │                       │◀─────────────────────┘   │                      │
-     │                       │                          │                      │
-     │                       │  IF BLOCKED:             │                      │
-     │◀──{guardrail msg}─────│                          │                      │
-     │                       │                          │                      │
-     │                       │──InvokeModel─────────────▶│                      │
-     │                       │  (embed query, 1024-dim) │                      │
-     │                       │◀─[query_vector]──────────│                      │
-     │                       │                          │                      │
-     │                       │──POST /points/search──────┼─────────────────────▶│
-     │                       │  {vector, k=20}          │                      │
-     │                       │◀─[dense_results]─────────┼──────────────────────│
-     │                       │                          │                      │
-     │                       │──[BM25 SEARCH]───────┐   │                      │
-     │                       │  (local, in-memory)   │   │                      │
-     │                       │◀─[sparse_results]────┘   │                      │
-     │                       │                          │                      │
-     │                       │──[RRF FUSION]────────┐   │                      │
-     │                       │  score = Σ 1/(60+rank)│   │                      │
-     │                       │  Sort by fused score  │   │                      │
-     │                       │◀─[hybrid_results]────┘   │                      │
-     │                       │                          │                      │
-     │                       │──[CONTEXT GATE]──────┐   │                      │
-     │                       │  top_rrf_score ≥ 0.01?│   │                      │
-     │                       │◀─────────────────────┘   │                      │
-     │                       │                          │                      │
-     │                       │  IF SCORE < 0.01:        │                      │
-     │◀──{insufficient ctx}──│  (Skip Bedrock, save $) │                      │
-     │                       │                          │                      │
-     │                       │──InvokeModel─────────────▶│                      │
-     │                       │  (Claude 3.5 Haiku)      │                      │
-     │                       │  system: financial analyst│                      │
-     │                       │  user: extracts + query  │                      │
-     │                       │  max_tokens: 1000        │                      │
-     │                       │  temperature: 0.1        │                      │
-     │                       │◀─[generated response]────│                      │
-     │                       │                          │                      │
-     │                       │──[OUTPUT GUARDRAIL]──┐   │                      │
-     │                       │  • Verify numbers     │   │                      │
-     │                       │  • Append disclaimer  │   │                      │
-     │                       │◀─────────────────────┘   │                      │
-     │                       │                          │                      │
-     │◀──200 OK──────────────│                          │                      │
-     │  {                    │                          │                      │
-     │    "response": "...", │                          │                      │
-     │    "citations": [...],│                          │                      │
-     │    "elapsed_ms": 1823 │                          │                      │
-     │  }                    │                          │                      │
-```
-
-### Retrieval Strategy Detail
-
-**Dense Search (Semantic):**
-- Query text → Bedrock Titan Embed v2 → 1024-dim vector
-- Vector sent to RuVector for cosine similarity search
-- Returns top-20 nearest neighbors with scores
-
-**Sparse Search (BM25):**
-- Query tokenized into terms
-- BM25 scoring against all chunk texts in the collection
-- Returns top-20 by term frequency relevance
-
-**Reciprocal Rank Fusion:**
-```
-For each document appearing in either list:
-  rrf_score += 1 / (k + rank_in_dense + 1)    if in dense results
-  rrf_score += 1 / (k + rank_in_sparse + 1)   if in sparse results
-
-Where k = 60 (dampening constant)
-```
-
-This ensures a document ranked #1 in both lists gets: `1/61 + 1/61 = 0.0328`
-A document ranked #1 in one list only gets: `1/61 = 0.0164`
-
-The top-4 documents by RRF score become the context for LLM generation.
-
----
-
-## 4. Guardrail Decision Flow
-
-```
-                    ┌──────────────────────┐
-                    │    User Query        │
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  INPUT GUARDRAIL     │
-                    │                      │
-                    │  ① Injection check   │──YES──▶ Return security warning
-                    │    (regex patterns)  │
-                    │                      │
-                    │  ② Domain check      │──YES──▶ Return domain warning
-                    │    (financial keywords)│        (only if query > 3 words
-                    │                      │         with no financial terms)
-                    └──────────┬───────────┘
-                               │ PASS
-                    ┌──────────▼───────────┐
-                    │  RETRIEVAL           │
-                    │  Dense + Sparse + RRF│
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  CONTEXT GATE        │
-                    │                      │
-                    │  RRF score < 0.01?   │──YES──▶ Return "insufficient context"
-                    │                      │         (LLM call SKIPPED = $0 cost)
-                    └──────────┬───────────┘
-                               │ PASS (score ≥ 0.01)
-                    ┌──────────▼───────────┐
-                    │  LLM GENERATION      │
-                    │  (Bedrock Claude)    │
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  OUTPUT GUARDRAIL    │
-                    │                      │
-                    │  ① Extract numbers   │
-                    │    from response     │
-                    │                      │
-                    │  ② Check each number │
-                    │    exists in context │
-                    │                      │
-                    │  ③ If not found:     │──▶ Append [!WARNING] notice
-                    │    flag hallucination│
-                    │                      │
-                    │  ④ Always append     │──▶ Financial disclaimer
-                    │    disclaimer        │
-                    └──────────┬───────────┘
-                               │
-                    ┌──────────▼───────────┐
-                    │  RETURN RESPONSE     │
-                    │  + Citations         │
-                    └──────────────────────┘
+Browser              RAG App                  Bedrock          Qdrant
+   │                    │                        │                │
+   │──POST /chat────────▶│                        │                │
+   │  {"message":"..."}  │                        │                │
+   │                    │                        │                │
+   │                    │──[INPUT GUARDRAIL]      │                │
+   │                    │  • injection patterns   │                │
+   │                    │  • domain keywords      │                │
+   │                    │  (financial + form)     │                │
+   │◀──{guardrail msg}──│ (if blocked)            │                │
+   │                    │                        │                │
+   │                    │──invoke_model(Titan)───▶│                │
+   │                    │◀──query_vector[1024]────│                │
+   │                    │                        │                │
+   │                    │──POST /points/search────────────────────▶│
+   │                    │  {"vector":[...],"limit":20,"with_payload":true}
+   │                    │◀──[{id,score,payload},...]──────────────│
+   │                    │                        │                │
+   │                    │──[BM25 search]          │                │
+   │                    │  (in-memory, local)     │                │
+   │                    │                        │                │
+   │                    │──[RRF Fusion]           │                │
+   │                    │  score = Σ 1/(60+rank)  │                │
+   │                    │                        │                │
+   │                    │──[CONTEXT GATE]         │                │
+   │                    │  top_rrf < 0.01?        │                │
+   │◀──{insufficient}───│ (skip LLM, save cost)  │                │
+   │                    │                        │                │
+   │                    │──invoke_model(Claude)──▶│                │
+   │                    │  (top 4 chunks as ctx)  │                │
+   │                    │◀──generated_text────────│                │
+   │                    │                        │                │
+   │                    │──[OUTPUT GUARDRAIL]     │                │
+   │                    │  • number verification  │                │
+   │                    │  • disclaimer append    │                │
+   │                    │                        │                │
+   │◀──200 OK───────────│                        │                │
+   │  {                 │                        │                │
+   │    "response":"...",│                       │                │
+   │    "citations":[...],                       │                │
+   │    "elapsed_ms":1823                        │                │
+   │  }                 │                        │                │
 ```
 
 ---
 
-## 5. Spot Instance Interruption Flow
-
-When AWS reclaims the RAG App Spot instance:
+## 4. PDF Extraction Decision Tree
 
 ```
-Timeline:
-─────────────────────────────────────────────────────────────────────▶
+PDF uploaded
+    │
+    ├─ reader.get_fields() → AcroForm fields?
+    │   YES → add as "page 0" chunk (entity name, SSN, EIN, etc.)
+    │   NO  → skip
+    │
+    └─ For each page:
+        │
+        ├─ pypdf layout extraction → len(text) >= 50?
+        │   YES → use layout text
+        │   NO  → try plain extraction → len(text) >= 50?
+        │           YES → use plain text
+        │           NO  → SCANNED PAGE
+        │                   │
+        │                   └─ Textract AnalyzeDocument(FORMS, TABLES)
+        │                       ├─ KEY_VALUE_SET blocks → form field pairs
+        │                       └─ LINE blocks → prose text
+        │
+        └─ page_contents.append((page_num, text))
+```
 
-T+0s: AWS sends 2-minute interruption notice
-      Instance receives SIGTERM
-      Docker container stops gracefully
+---
 
-T+2m: Instance stopped
-      ALB health check starts failing
+## 5. Chunking Decision Tree
 
-T+2m30s: ALB detects 1st failure (unhealthy count: 1/3)
-T+3m00s: ALB detects 2nd failure (unhealthy count: 2/3)
-T+3m30s: ALB detects 3rd failure → Target marked UNHEALTHY
-         ALB stops routing traffic
+```
+chunk_document(text, doc_name, page_contents)
+    │
+    ├─ is_form_document(text)?
+    │   Checks for: W-9, W-2, 1099, 1040, TIN, SSN, EIN,
+    │   "Taxpayer Identification", "Part I/II", "Request for Taxpayer"
+    │   (≥2 patterns must match)
+    │
+    │   YES → Form path:
+    │           For each (page_num, page_text) in page_contents:
+    │               chunk_page(page_text, doc_name, page_num)
+    │               ├─ Keep every line (no filtering)
+    │               ├─ 700-char windows
+    │               └─ 3-line overlap (label stays with value)
+    │
+    └─ NO → Report path:
+            ├─ parse_table_from_text() → table row chunks
+            └─ Sliding prose chunks (700 chars, 120 overlap)
+               Skip paragraphs with ≥6 pipes (pure table data)
+```
 
-T+3m30s-T+5m: Spot fleet requests replacement instance
-               New instance launches in private subnet
+---
 
-T+5m-T+10m: user_data/rag_app.sh executes:
+## 6. Guardrail Decision Flow
+
+```
+User Query
+    │
+    ├─ Injection check (regex):
+    │   "ignore previous instructions", "system prompt",
+    │   "you are now", "forget everything", "override rules"
+    │   → BLOCKED: security warning
+    │
+    ├─ Domain check (keyword match, only if query > 3 words):
+    │   Financial: revenue, profit, ebitda, tax, margin, ...
+    │   Document:  name, entity, ssn, tin, what, extract, w-9, ...
+    │   → BLOCKED if zero matches: domain warning
+    │
+    ├─ Retrieval (dense + sparse + RRF)
+    │
+    ├─ Context gate: top_rrf_score < 0.01?
+    │   → BLOCKED: "insufficient context" (LLM call skipped)
+    │
+    ├─ LLM generation (Claude Haiku 4.5)
+    │
+    └─ Output guardrail:
+        ├─ Extract numbers from response
+        ├─ Check each number exists in context
+        ├─ If not found → append [!WARNING] notice
+        └─ Always append financial disclaimer
+```
+
+---
+
+## 7. Spot Instance Interruption Flow
+
+```
+T+0s:    AWS sends 2-minute interruption notice
+         Container stops gracefully
+
+T+2m:    Instance stopped
+         ALB health checks start failing
+
+T+3m30s: ALB marks target UNHEALTHY (3 × 30s failures)
+         Traffic stops routing to RAG App
+
+T+3m30s–T+5m: Spot fleet requests replacement instance
+
+T+5m–T+10m: user_data/rag_app.sh executes:
             - Install Docker (~1 min)
-            - Clone repo + build image (~3 min)
-            - Start container (~30s)
+            - Wait for Qdrant /healthz
+            - git clone + docker build (~3 min)
+            - docker run --network host
             - Health check passes
 
-T+10m: ALB detects 1st healthy response (healthy count: 1/2)
-T+10m30s: ALB detects 2nd healthy response → Target HEALTHY
+T+10m30s: ALB marks target HEALTHY (2 × 30s successes)
           Traffic resumes
 ```
 
-**User impact:** ~7-8 minutes of downtime. During this window, users see ALB 502/503 errors.
-
-**Data impact:** Zero. RuVector runs on a separate On-Demand instance. All vector data is preserved.
+**Data impact:** Zero. Qdrant runs on a separate On-Demand instance with a persistent EBS volume. All vector data is preserved across RAG App interruptions.
 
 ---
 
-## 6. Error Handling Flows
-
-### 6.1 Bedrock Timeout/Throttle
+## 8. Collection Clear Flow
 
 ```
-RAG App                        Bedrock
-   │                              │
-   │──InvokeModel────────────────▶│
-   │                              │──[30s timeout exceeded]
-   │◀─TimeoutError────────────────│
-   │                              │
-   │──[Retry 1, exponential backoff]──▶│
-   │◀─ThrottlingException─────────│
-   │                              │
-   │──[Retry 2, longer backoff]───▶│
-   │◀─200 OK─────────────────────│
-   │                              │
+POST /collections/clear
+    │
+    ├─ Reset in-memory BM25 index for collection
+    │
+    ├─ httpx.AsyncClient #1:
+    │   DELETE /collections/{name}
+    │   (200 = deleted, 404 = didn't exist — both OK)
+    │   Client closed ← important: Qdrant closes TCP after DELETE
+    │
+    └─ httpx.AsyncClient #2 (new connection):
+        PUT /collections/{name}
+        {"vectors": {"size": 1024, "distance": "Cosine"}}
+        (200/201 = success)
 ```
 
-**Config:** Max 3 retries with adaptive backoff (botocore adaptive mode).
-**Fallback:** If all retries fail, return error message to user. Service continues accepting requests.
-
-### 6.2 RuVector Connection Failure
-
-```
-RAG App                        RuVector
-   │                              │
-   │──POST /points/search─────────▶│ (connection refused / timeout)
-   │◀─ConnectionError─────────────│
-   │                              │
-   │  dense_results = []          │
-   │  Continue with sparse-only   │
-   │  retrieval if BM25 available │
-```
-
-The system degrades gracefully:
-- Dense search fails → sparse-only results used
-- Both fail → "No documents ingested" message returned
-- Health endpoint reports `"ruvector": "unavailable"`
-
-### 6.3 Document Parse Failure
-
-```
-User                    RAG App
- │                        │
- │──POST /ingest─────────▶│
- │  (corrupted.pdf)      │
- │                        │──[PdfReader throws]
- │                        │
- │◀──400 Bad Request──────│
- │  {"detail": "Failed   │
- │   to parse document:  │
- │   [error details]"}   │
- │                        │
- │  Job status:           │
- │  "failed"              │
- │  Temp file: deleted    │
-```
-
-### 6.4 Upload Size Exceeded
-
-```
-User                    RAG App
- │                        │
- │──POST /ingest─────────▶│
- │  (150MB file)          │
- │                        │──[Streaming, counting bytes]
- │                        │  At 100MB+1 byte:
- │                        │──[Delete temp file]
- │                        │
- │◀──413 Payload Too Large│
- │  {"detail": "File     │
- │   exceeds 100 MB"}    │
-```
+**Why two separate clients?** Qdrant closes the TCP connection after a DELETE response. Reusing the same `httpx.AsyncClient` for the subsequent PUT causes "All connection attempts failed". Separate `async with` blocks create fresh connection pools.
 
 ---
 
-## 7. Session Persistence Flow
-
-The frontend persists chat history to survive page reloads.
-
-```
-┌─────────────────── Page Lifecycle ───────────────────────┐
-│                                                           │
-│  Page Load                                                │
-│  ├── DOMContentLoaded fires                              │
-│  ├── restoreSession()                                     │
-│  │   ├── Read localStorage['rag_chat_session']           │
-│  │   ├── Parse JSON → messages array                     │
-│  │   ├── For each message:                               │
-│  │   │   ├── type='user'   → appendMessage(text, 'user')│
-│  │   │   ├── type='bot'    → appendMessage + citations   │
-│  │   │   └── type='system' → addSystemMessage(text)      │
-│  │   └── Hide welcome screen if messages exist           │
-│  └── Start health check interval                         │
-│                                                           │
-│  User Interaction                                         │
-│  ├── Send message                                         │
-│  │   ├── appendMessage(text, 'user') → saves to DOM      │
-│  │   ├── saveSession() → serialize DOM → localStorage    │
-│  │   ├── Fetch /chat                                      │
-│  │   ├── updateBotMessage(id, response, citations)        │
-│  │   └── saveSession() → update localStorage             │
-│  │                                                        │
-│  ├── Upload document                                      │
-│  │   ├── Fetch /ingest                                    │
-│  │   ├── addSystemMessage(success) → saves to DOM         │
-│  │   └── saveSession() → update localStorage             │
-│  │                                                        │
-│  └── New Chat clicked                                     │
-│      ├── confirm() dialog                                 │
-│      ├── clearSession() → localStorage.removeItem()       │
-│      └── location.reload() → fresh page                  │
-│                                                           │
-└───────────────────────────────────────────────────────────┘
-```
-
-### Storage Schema
-
-```json
-{
-  "messages": [
-    {
-      "type": "user",
-      "text": "What was EBITDA in Q3 2024?",
-      "citations": [],
-      "timestamp": 1700000000000
-    },
-    {
-      "type": "bot",
-      "text": "Based on the annual report, Q3 2024 EBITDA was...",
-      "citations": [
-        {
-          "source": "annual_report_2024.pdf",
-          "type": "table_row",
-          "header": "Quarterly EBITDA",
-          "snippet": "Q3 2024: $142.5M..."
-        }
-      ],
-      "timestamp": 1700000002000
-    },
-    {
-      "type": "system",
-      "text": "Successfully ingested document **report.pdf** (42 chunks loaded)...",
-      "citations": [],
-      "timestamp": 1700000005000
-    }
-  ],
-  "created": 1700000000000
-}
-```
-
-**Storage limits:** localStorage typically allows 5-10 MB. For a chat session with ~100 messages and citations, usage is typically under 500 KB.
-
----
-
-## 8. End-to-End Latency Breakdown
-
-Typical chat query latency (warm system, documents already ingested):
+## 9. End-to-End Latency
 
 | Step | Duration | Notes |
 |------|----------|-------|
-| Input guardrail | < 1 ms | Regex matching, in-memory |
-| Query embedding (Bedrock Titan) | 100-300 ms | VPC Endpoint, no internet hop |
-| Dense search (RuVector) | 5-20 ms | Same AZ, private subnet |
-| BM25 sparse search | 1-5 ms | In-memory, local process |
-| RRF fusion | < 1 ms | Simple arithmetic |
-| Context gate check | < 1 ms | Score comparison |
-| LLM generation (Bedrock Haiku) | 800-2000 ms | Depends on output length |
-| Output guardrail | 1-5 ms | Regex + string matching |
+| Input guardrail | < 1 ms | Regex, in-memory |
+| Query embedding (Titan) | 100-300 ms | Via VPC endpoint |
+| Dense search (Qdrant) | 5-20 ms | Same VPC |
+| BM25 sparse search | 1-5 ms | In-memory |
+| RRF fusion | < 1 ms | Arithmetic |
+| Context gate | < 1 ms | Score comparison |
+| LLM generation (Claude Haiku) | 800-2000 ms | Depends on output length |
+| Output guardrail | 1-5 ms | Regex |
 | **Total** | **~1-2.5 seconds** | |
 
-The context gate (step 6) can short-circuit the entire LLM call, reducing latency to ~200-400 ms for low-confidence queries while also saving ~$0.003 per skipped call.
+Context gate short-circuits at ~200-400 ms for low-confidence queries, saving ~$0.003 per skipped LLM call.

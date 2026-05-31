@@ -1,71 +1,118 @@
 import re
-import pandas as pd
-from io import StringIO
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
+
 
 class SmartFinancialChunker:
     """
-    An intelligent chunker custom-tailored for financial documents.
-    Preserves tabular rows, respects sentence boundaries, and injects 
-    contextual metadata (e.g. document name, section headers) into every chunk
-    to maximize retrieval accuracy while keeping chunk sizes small.
+    Chunker for financial documents AND structured forms (W-9, 1099, etc.).
+
+    For forms: chunks each page separately so filled values on page 1
+    don't get buried under 5 pages of instructions.
+
+    For reports: standard sliding-window prose + table chunking.
     """
-    
+
     def __init__(self, chunk_size: int = 600, overlap: int = 100):
         self.chunk_size = chunk_size
         self.overlap = overlap
 
     def clean_text(self, text: str) -> str:
-        # Standardize whitespace and remove non-printable chars
         text = re.sub(r'[ \t]+', ' ', text)
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
+    def is_form_document(self, text: str) -> bool:
+        """Detect structured tax/legal forms vs narrative financial reports."""
+        form_patterns = [
+            r'\bW-9\b', r'\bW9\b', r'\b1099\b', r'\b1040\b', r'\bW-2\b',
+            r'\bTIN\b', r'\bSSN\b', r'\bEIN\b',
+            r'Taxpayer Identification',
+            r'Social security number',
+            r'Employer identification number',
+            r'Line \d+',
+            r'Part I\b', r'Part II\b',
+            r'Request for Taxpayer',
+        ]
+        matches = sum(1 for p in form_patterns if re.search(p, text, re.IGNORECASE))
+        return matches >= 2
+
     def is_table_row(self, line: str) -> bool:
-        # Check if line looks like a table row (multiple columns separated by tabs, commas, pipes, or spaces)
         line = line.strip()
         if not line:
             return False
-        # Pipes
         if line.count('|') >= 2:
             return True
-        # Tabs or commas with numbers
         if line.count('\t') >= 1 or line.count(',') >= 2:
-            # Check if there are numbers representing financial metrics
             if re.search(r'\d+', line):
                 return True
-        # Double spaces indicating columns
         if len(re.split(r'  +', line)) >= 3:
             return True
         return False
 
+    def chunk_page(self, page_text: str, doc_name: str, page_num: int) -> List[Dict[str, Any]]:
+        """
+        Chunk a single page into overlapping windows.
+        Every line is kept — no filtering — so short form values are preserved.
+        """
+        lines = [l for l in page_text.split('\n') if l.strip()]
+        chunks = []
+        current_lines: List[str] = []
+        current_len = 0
+
+        for line in lines:
+            line_len = len(line)
+            if current_len + line_len > self.chunk_size and current_lines:
+                chunk_text = '\n'.join(current_lines)
+                chunks.append({
+                    "text": f"Source: {doc_name}\nPage: {page_num}\nDocument: {doc_name}\nContent:\n{chunk_text}",
+                    "metadata": {
+                        "type": "form_field",
+                        "source": doc_name,
+                        "page": page_num
+                    }
+                })
+                # 3-line overlap so field label + value don't get split across chunks
+                current_lines = current_lines[-3:]
+                current_len = sum(len(l) for l in current_lines)
+
+            current_lines.append(line)
+            current_len += line_len
+
+        if current_lines:
+            chunk_text = '\n'.join(current_lines)
+            chunks.append({
+                "text": f"Source: {doc_name}\nPage: {page_num}\nDocument: {doc_name}\nContent:\n{chunk_text}",
+                "metadata": {
+                    "type": "form_field",
+                    "source": doc_name,
+                    "page": page_num
+                }
+            })
+
+        return chunks
+
     def parse_table_from_text(self, text: str) -> List[Dict[str, Any]]:
-        """
-        Attempts to detect, extract, and clean tabular blocks from text,
-        formatting them as individual context-rich rows.
-        """
         lines = text.split('\n')
         chunks = []
         in_table = False
-        table_lines = []
+        table_lines: List[str] = []
         table_start_index = 0
-        
+
         for i, line in enumerate(lines):
             is_row = self.is_table_row(line)
-            
             if is_row and not in_table:
                 in_table = True
                 table_lines = [line]
-                table_start_index = max(0, i - 2) # Capture preceding headers (usually 1-2 lines above)
+                table_start_index = max(0, i - 2)
             elif is_row and in_table:
                 table_lines.append(line)
             elif not is_row and in_table:
-                # Table ended. Process table lines
                 in_table = False
-                headers = [lines[j].strip() for j in range(table_start_index, table_start_index + (i - len(table_lines) - table_start_index))]
+                headers = [lines[j].strip() for j in range(
+                    table_start_index,
+                    table_start_index + (i - len(table_lines) - table_start_index)
+                )]
                 headers_str = " | ".join([h for h in headers if h])
-                
-                # Create detailed chunks for each table row with header context
                 table_context = f"Table Header Context: {headers_str}" if headers_str else "Financial Table Data"
                 for row in table_lines:
                     if row.strip():
@@ -74,10 +121,11 @@ class SmartFinancialChunker:
                             "metadata": {"type": "table_row", "header": headers_str[:100]}
                         })
                 table_lines = []
-        
-        # Catch lingering table at end of document
+
         if in_table and table_lines:
-            headers = [lines[j].strip() for j in range(table_start_index, max(0, len(lines) - len(table_lines)))]
+            headers = [lines[j].strip() for j in range(
+                table_start_index, max(0, len(lines) - len(table_lines))
+            )]
             headers_str = " | ".join([h for h in headers if h])
             table_context = f"Table Header Context: {headers_str}" if headers_str else "Financial Table Data"
             for row in table_lines:
@@ -86,54 +134,62 @@ class SmartFinancialChunker:
                         "text": f"{table_context}\nRow Data: {row.strip()}",
                         "metadata": {"type": "table_row", "header": headers_str[:100]}
                     })
-                    
+
         return chunks
 
-    def chunk_document(self, text: str, doc_name: str) -> List[Dict[str, Any]]:
+    def chunk_document(
+        self,
+        text: str,
+        doc_name: str,
+        page_contents: Optional[List[Tuple[int, str]]] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Main entry point for chunking. Segregates tabular data from prose text,
-        chunks prose text using sliding semantic windows, and combines them.
+        Main entry point.
+
+        page_contents: list of (page_number, page_text) tuples from pypdf.
+        When provided and the document is a form, each page is chunked
+        independently so page-1 filled values aren't buried by later pages.
         """
         cleaned_text = self.clean_text(text)
-        
-        # 1. First, extract tabular chunks
+
+        # Form path: chunk each page separately
+        if self.is_form_document(cleaned_text) and page_contents:
+            all_chunks = []
+            for page_num, page_text in page_contents:
+                cleaned_page = self.clean_text(page_text)
+                page_chunks = self.chunk_page(cleaned_page, doc_name, page_num)
+                all_chunks.extend(page_chunks)
+            return all_chunks
+
+        # Standard financial report path
         table_chunks = self.parse_table_from_text(cleaned_text)
-        
-        # 2. Next, extract prose chunks
-        # To avoid double-ingesting tables, we can filter out heavy table rows from the prose engine, 
-        # but for simplicity and safety, we run sentence-based chunking on the whole document.
         prose_chunks = []
-        
-        # Split text into paragraphs
         paragraphs = cleaned_text.split('\n\n')
-        current_chunk = []
+        current_chunk: List[str] = []
         current_len = 0
-        
+
         for paragraph in paragraphs:
             paragraph = paragraph.strip()
             if not paragraph:
                 continue
-                
-            # If paragraph contains heavy table data, we skip or treat lightly
-            if paragraph.count('|') >= 4 and len(paragraph) < 1000:
-                continue # Tabular chunker will handle this cleaner
-                
+
+            # Only skip paragraphs that are pure pipe-table data
+            if paragraph.count('|') >= 6 and len(paragraph) < 1000:
+                continue
+
             para_len = len(paragraph)
-            
+
             if current_len + para_len > self.chunk_size:
-                # Save existing chunk
                 if current_chunk:
                     chunk_text = "\n\n".join(current_chunk)
                     prose_chunks.append({
                         "text": f"Document: {doc_name}\nContent:\n{chunk_text}",
                         "metadata": {"type": "prose"}
                     })
-                
-                # Handle paragraph overlap
-                # If paragraph itself is too large, we split it into sentences
+
                 if para_len > self.chunk_size:
                     sentences = re.split(r'(?<=[.!?]) +', paragraph)
-                    sub_chunk = []
+                    sub_chunk: List[str] = []
                     sub_len = 0
                     for sentence in sentences:
                         sub_len += len(sentence)
@@ -143,7 +199,6 @@ class SmartFinancialChunker:
                                 "text": f"Document: {doc_name}\nContent:\n{' '.join(sub_chunk)}",
                                 "metadata": {"type": "prose"}
                             })
-                            # Overlap sentences
                             sub_chunk = sub_chunk[-2:] if len(sub_chunk) >= 2 else sub_chunk
                             sub_len = sum(len(s) for s in sub_chunk)
                     current_chunk = sub_chunk
@@ -153,17 +208,15 @@ class SmartFinancialChunker:
                     current_len = para_len
             else:
                 current_chunk.append(paragraph)
-                current_len += para_len + 2 # account for newline join
-                
-        # Append final chunk
+                current_len += para_len + 2
+
         if current_chunk:
             chunk_text = "\n\n".join(current_chunk)
             prose_chunks.append({
                 "text": f"Document: {doc_name}\nContent:\n{chunk_text}",
                 "metadata": {"type": "prose"}
             })
-            
-        # 3. Add document metadata to all chunks and merge
+
         all_chunks = []
         for c in table_chunks + prose_chunks:
             meta = c["metadata"]
@@ -172,5 +225,5 @@ class SmartFinancialChunker:
                 "text": f"Source: {doc_name}\n{c['text']}",
                 "metadata": meta
             })
-            
+
         return all_chunks

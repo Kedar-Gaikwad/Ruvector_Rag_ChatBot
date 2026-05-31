@@ -2,100 +2,134 @@
 
 ## System Summary
 
-The RuVector RAG ChatBot is a financial document analysis system that combines:
+A financial document analysis system that ingests PDFs, spreadsheets, and tax forms, then answers questions using hybrid vector + keyword retrieval backed by AWS Bedrock.
 
-1. **RuVector** — A Rust-based vector database using HNSW indexing for approximate nearest-neighbor search
-2. **FastAPI Backend** — Handles document ingestion, hybrid retrieval, guardrails, and LLM orchestration
-3. **AWS Bedrock** — Managed AI services for embedding generation (Titan) and text generation (Claude 3.5 Haiku)
-4. **Glassmorphic Frontend** — Single-page chat UI with real-time progress, citation exploration, and session persistence
-
-The system is designed for corporate financial document analysis — balance sheets, income statements, annual reports — with built-in guardrails that prevent hallucination, enforce domain relevance, and gate LLM calls based on retrieval confidence.
+**Stack:**
+- **FastAPI** backend — ingestion, retrieval, guardrails, LLM orchestration
+- **Qdrant v1.9.2** — vector database (HNSW, cosine similarity)
+- **AWS Bedrock** — Titan Embed Text v2 (embeddings) + Claude Haiku 4.5 (generation)
+- **Amazon Textract** — OCR fallback for scanned PDFs and form field extraction
+- **Glassmorphic frontend** — single-page chat UI with polling-based upload progress
 
 ---
 
-## Component Descriptions
-
-### 1. RAG App (FastAPI Backend)
-
-**File:** `rag_app/backend/app.py`
-
-The core application server exposing these endpoints:
+## API Endpoints
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/health` | GET | ALB health check — returns 200 with RuVector connectivity status |
-| `/ingest` | POST | Upload documents (PDF/Excel/CSV/TXT, up to 100 MB) |
-| `/ingest/status/{job_id}` | GET | Poll ingestion progress (percentage, pages processed) |
-| `/chat` | POST | Query the RAG pipeline — hybrid retrieval + LLM generation |
-| `/collections` | GET | List vector collections in RuVector |
+| `/health` | GET | ALB health check — returns 200 with Qdrant + Bedrock status |
+| `/health/bedrock` | GET | Deep Bedrock check — calls Titan Embed, returns dimension count |
+| `/debug/extract` | POST | Shows what each PDF extraction layer produces (AcroForm, pypdf, Textract) |
+| `/ingest` | POST | Upload document — returns `job_id` immediately, processes in background |
+| `/ingest/status/{job_id}` | GET | Poll ingestion progress (pct, pages, chunks) |
+| `/chat` | POST | Hybrid RAG query — returns response + citations |
+| `/collections` | GET | List Qdrant collections |
 | `/collections/clear` | POST | Delete and recreate a collection |
 
-**Key Design Choices:**
+---
 
-- **No hardcoded credentials** — Uses IAM instance role for Bedrock authentication
-- **Streaming ingestion** — Files saved to disk in 10 MB chunks to stay within t3.medium memory (4 GB)
-- **Adaptive retries** — Bedrock client uses exponential backoff with 3 max attempts
-- **Structured logging** — ISO 8601 timestamps, service name, request ID for CloudWatch Insights queries
+## PDF Extraction — Three-Layer Strategy
 
-### 2. RuVector Vector Database
-
-**Image:** `ruvnet/ruvector:latest`
-
-A containerized vector database providing:
-
-- **HNSW Index** — Hierarchical Navigable Small World graph for fast approximate nearest-neighbor search
-- **Cosine Similarity** — Default metric for financial text embeddings
-- **REST API** — Create/delete collections, upsert points, similarity search
-- **Persistent Storage** — Data directory mounted from dedicated EBS volume
-
-**Port:** 6333 (restricted to RAG App security group in production)
-
-### 3. Hybrid Retrieval Pipeline
-
-The system uses two complementary retrieval methods blended via Reciprocal Rank Fusion (RRF):
+The system handles all PDF types without requiring pre-processing:
 
 ```
-Query → [Dense Search (RuVector)] ──┐
-                                     ├── RRF Fusion → Top-4 → LLM
-Query → [Sparse Search (BM25)]   ──┘
+PDF File
+    │
+    ├─ Layer 1: AcroForm Fields (document-level)
+    │   pypdf reader.get_fields() extracts /AcroForm values
+    │   Works for any filled interactive PDF form (W-9, 1099, etc.)
+    │   Added as a standalone "page 0" chunk — not tied to any page number
+    │
+    ├─ Layer 2: pypdf Layout Extraction (native text PDFs)
+    │   page.extract_text(extraction_mode="layout") per page
+    │   Better spatial ordering than default extraction
+    │   If page yields < 50 chars → treated as scanned → Layer 3
+    │
+    └─ Layer 3: Amazon Textract (scanned/image pages)
+        AnalyzeDocument with FORMS + TABLES feature types
+        Extracts key-value pairs from form fields
+        Extracts LINE blocks for prose content
+        Requires textract:AnalyzeDocument IAM permission
 ```
 
-- **Dense (Semantic):** Query embedding compared against stored vectors via cosine similarity. Captures conceptual meaning.
-- **Sparse (Keyword):** BM25 term-frequency scoring against raw text. Captures exact keyword matches.
-- **RRF Blending:** `score = Σ 1/(k + rank)` with k=60. Ensures both exact matches and semantic results are represented.
+**Why three layers?** A single PDF can mix native text pages (instructions) with scanned pages (filled form). Each page is evaluated independently.
 
-### 4. Guardrail System
+---
 
-Three-layer protection:
+## Document Chunking — Form-Aware
+
+`SmartFinancialChunker` detects document type and routes accordingly:
+
+**Form detection** (`is_form_document`): looks for W-9, W-2, 1099, 1040, TIN, SSN, EIN, "Taxpayer Identification", "Part I/II" patterns. If ≥2 match → form path.
+
+**Form path** (`chunk_page`):
+- Each page chunked independently (filled values on page 1 don't get buried by 5 pages of instructions)
+- Every line kept — no filtering — short values like `Sai vishnu Enterprise` or `699-78-9262` are preserved
+- 3-line overlap between chunks so field labels stay with their values
+
+**Report path** (standard):
+- Table rows extracted with header context
+- Prose chunked in 700-char sliding windows with 120-char overlap
+- Paragraphs with ≥6 pipes skipped (pure table data handled by table extractor)
+
+---
+
+## Hybrid Retrieval
+
+```
+Query
+  │
+  ├─ Dense: Titan Embed → Qdrant cosine search (top 20)
+  │
+  ├─ Sparse: BM25 in-memory index (top 20)
+  │
+  └─ RRF Fusion: score = Σ 1/(60 + rank)
+       │
+       └─ Top 4 chunks → Claude Haiku → Response
+```
+
+**Qdrant REST API used:**
+- `PUT /collections/{name}` — create/update with `{"vectors": {"size": 1024, "distance": "Cosine"}}`
+- `PUT /collections/{name}/points` — upsert with UUID IDs and `payload` field (not `metadata`)
+- `POST /collections/{name}/points/search` — search with `{"vector": [...], "limit": 20, "with_payload": true}`
+- `GET /healthz` — liveness probe (not `/health`)
+
+---
+
+## Guardrail System
 
 | Layer | When | What |
 |-------|------|------|
-| **Input Guardrail** | Before retrieval | Blocks prompt injection, enforces financial domain |
-| **Context Gate** | After retrieval | Skips LLM if RRF score < 0.01 (saves Bedrock costs) |
-| **Output Guardrail** | After generation | Flags numbers not found in context, appends disclaimer |
+| **Input** | Before retrieval | Blocks prompt injection patterns; enforces domain relevance (financial + document/form keywords) |
+| **Context Gate** | After retrieval | Skips LLM if top RRF score < 0.01 (saves Bedrock cost) |
+| **Output** | After generation | Flags numbers not found in context; appends financial disclaimer |
 
-### 5. Smart Financial Chunker
+**Domain keywords** cover both financial reports (`revenue`, `ebitda`, `margin`) and document extraction (`name`, `entity`, `ssn`, `tin`, `what`, `extract`, `w-9`).
 
-**File:** `rag_app/backend/chunker.py`
+---
 
-Intelligent document segmentation that:
+## Ingestion Flow (Async)
 
-- Preserves table structures (detects column alignment, pipe tables, CSV rows)
-- Respects section headers (keeps header with following content)
-- Uses 700-token chunks with 120-token overlap
-- Tags each chunk with metadata: source file, type (prose/table_row), header context, page number
+```
+POST /ingest
+    │
+    ├─ Stream file to disk (10 MB chunks, max 100 MB)
+    ├─ Register job_id with status="processing"
+    ├─ Return {"status":"accepted","job_id":"..."} immediately
+    │
+    └─ Background task:
+        ├─ extract_pdf() — 3-layer extraction
+        ├─ SmartFinancialChunker.chunk_document()
+        ├─ BM25 index update
+        ├─ Qdrant collection create/ensure
+        ├─ Bedrock Titan embeddings (batches of 10)
+        └─ Qdrant upsert (batches of 10)
 
-### 6. Frontend (Session-Persistent Chat UI)
+GET /ingest/status/{job_id}
+    └─ Returns progress_pct, chunks_created, status, error
+```
 
-**File:** `rag_app/frontend/index.html`
-
-Single HTML file with:
-
-- **Glassmorphic design** — Dark mode, blur effects, gradient accents
-- **Session persistence** — Chat history stored in localStorage, survives reloads
-- **Citation drawer** — Click citations to view source extracts in slide-over panel
-- **Upload progress** — Real-time progress bar during document ingestion
-- **Health monitoring** — Auto-polls VectorDB status every 10 seconds
+The async pattern avoids ALB 504 timeouts. The ALB idle timeout is set to 300s as a safety net.
 
 ---
 
@@ -103,60 +137,58 @@ Single HTML file with:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RUVECTOR_URL` | `http://172.17.0.1:6333` | RuVector REST API endpoint |
-| `EMBEDDING_PROVIDER` | `bedrock` | Embedding backend (`bedrock`) |
-| `LLM_PROVIDER` | `bedrock` | LLM backend (`bedrock` or `mock`) |
-| `AWS_REGION` | `us-east-1` | AWS region for Bedrock API calls |
+| `RUVECTOR_URL` | `http://172.17.0.1:6333` | Qdrant REST endpoint |
+| `EMBEDDING_PROVIDER` | `bedrock` | Must be `bedrock` |
+| `LLM_PROVIDER` | `bedrock` | `bedrock` or `mock` |
+| `AWS_REGION` | `us-east-1` | AWS region for all service calls |
+| `AWS_DEFAULT_REGION` | `us-east-1` | boto3 fallback region |
+
+On EC2, credentials come from the IAM instance role via IMDS (`169.254.169.254`). The container runs with `--network host` to reach IMDS. On local dev, pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` via `.env` file.
 
 ---
 
-## Data Models
+## Models Used
 
-### Vector Point
+| Model | ID | Purpose |
+|-------|----|---------|
+| Titan Embed Text v2 | `amazon.titan-embed-text-v2:0` | 1024-dim embeddings |
+| Claude Haiku 4.5 | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | RAG generation (US Cross-Region Inference Profile) |
 
-```json
-{
-  "id": "annual_report_2024.pdf_42_1717000000",
-  "vector": [0.012, -0.034, ...],  // 1024 dimensions
-  "metadata": {
-    "text": "Revenue for Q3 2024 was $142.5M...",
-    "source": "annual_report_2024.pdf",
-    "type": "prose",
-    "header": "Revenue by Segment",
-    "page": 12
-  }
-}
+---
+
+## Local Development
+
+```bash
+# Copy credentials template
+cp .env.example .env
+# Edit .env with your AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+
+# Start everything
+docker compose --env-file .env up --build
+
+# Verify
+curl http://localhost:8000/health
 ```
 
-### Chat Response
+The `docker-compose.yml` mirrors the AWS architecture: `qdrant` service (v1.9.2) + `rag-chatbot` service. Qdrant data persists in a named volume `qdrant_data`.
 
-```json
-{
-  "response": "Based on the annual report, Q3 2024 EBITDA was...",
-  "citations": [
-    {
-      "source": "annual_report_2024.pdf",
-      "type": "table_row",
-      "header": "Quarterly EBITDA",
-      "snippet": "Q3 2024: $142.5M..."
-    }
-  ],
-  "elapsed_ms": 1823.4
-}
+---
+
+## Deploy Updates (No Terraform)
+
+After pushing code changes to GitHub:
+
+```bash
+# Option 1: SSH directly
+cd /home/ubuntu/rag_app && sudo git pull
+sudo docker build -t rag-chatbot -f Dockerfile .
+sudo docker stop rag-chatbot && sudo docker rm rag-chatbot
+sudo docker run -d --name rag-chatbot --restart unless-stopped --network host \
+  -e RUVECTOR_URL="http://<qdrant-private-ip>:6333" \
+  -e EMBEDDING_PROVIDER="bedrock" -e LLM_PROVIDER="bedrock" \
+  -e AWS_REGION="us-east-1" -e AWS_DEFAULT_REGION="us-east-1" \
+  rag-chatbot
+
+# Option 2: deploy.sh via SSM (no SSH needed)
+./deploy.sh <instance-id> <qdrant-private-ip>
 ```
-
-### Ingestion Status
-
-```json
-{
-  "job_id": "a1b2c3d4-...",
-  "filename": "report.pdf",
-  "status": "processing",
-  "progress_pct": 65,
-  "total_pages": 120,
-  "processed_pages": 78,
-  "chunks_created": 342,
-  "error": null
-}
-```
-

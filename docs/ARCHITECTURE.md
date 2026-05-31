@@ -2,12 +2,13 @@
 
 ## Overview
 
-This document describes the complete AWS infrastructure for the RuVector RAG ChatBot multi-service deployment. The architecture separates the stateless RAG application from the persistent vector database onto independent EC2 instances, connected via private VPC networking, with AWS Bedrock for AI and an Application Load Balancer for external access.
+Two-instance AWS architecture deployed via a single `terraform apply`. A stateless FastAPI RAG application runs on EC2 Spot, and a persistent Qdrant vector database runs on EC2 On-Demand. Both instances are in the public subnet with internet access for bootstrapping. AWS Bedrock provides embeddings and LLM. Amazon Textract provides OCR for scanned documents.
 
 **Design Goals:**
 - Service isolation (independent scaling, updates, restarts)
-- Private network communication (no public exposure of vector DB)
+- Public subnet deployment for internet access (git clone, docker pull) without NAT Gateway
 - Managed AI via Bedrock (no GPU instances)
+- OCR for scanned PDFs via Textract (no self-hosted OCR)
 - Cost target under $50/month for POC
 - Single `terraform apply` deployment
 
@@ -17,56 +18,52 @@ This document describes the complete AWS infrastructure for the RuVector RAG Cha
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              AWS Cloud (us-east-1)                           │
+│                              AWS Cloud (us-east-1)                          │
 │                                                                             │
 │  ┌───────────────────────── VPC 10.0.0.0/16 ─────────────────────────────┐ │
 │  │                                                                        │ │
-│  │  ┌──── Public Subnet 10.0.1.0/24 ────┐  ┌── Public Subnet B ──┐      │ │
+│  │  ┌──── Public Subnet A 10.0.1.0/24 ──┐  ┌── Public Subnet B ──┐      │ │
 │  │  │                                    │  │    10.0.3.0/24      │      │ │
-│  │  │   ┌──────────────────────────┐     │  │    (ALB AZ-b)      │      │ │
-│  │  │   │   Application Load       │     │  └────────────────────┘      │ │
-│  │  │   │   Balancer (ALB)         │     │                              │ │
-│  │  │   │   Port 80 (HTTP)         │     │                              │ │
-│  │  │   └──────────┬───────────────┘     │                              │ │
-│  │  └──────────────┼────────────────────-┘                              │ │
-│  │                 │ :8000                                               │ │
-│  │  ┌──── Private Subnet 10.0.2.0/24 ───────────────────────────────┐   │ │
-│  │  │              │                                                  │   │ │
-│  │  │   ┌──────────▼───────────────┐    ┌─────────────────────────┐ │   │ │
-│  │  │   │   RAG App EC2            │    │   RuVector EC2          │ │   │ │
-│  │  │   │   t3.medium (Spot)       │    │   t3.medium (On-Demand) │ │   │ │
-│  │  │   │                          │    │                         │ │   │ │
-│  │  │   │   ┌──────────────────┐   │    │   ┌─────────────────┐  │ │   │ │
-│  │  │   │   │ Docker Container │   │    │   │ Docker Container│  │ │   │ │
-│  │  │   │   │ rag-chatbot      │   │    │   │ ruvector:latest │  │ │   │ │
-│  │  │   │   │ Port 8000        │───┼────┼──▶│ Port 6333       │  │ │   │ │
-│  │  │   │   └──────────────────┘   │    │   └─────────────────┘  │ │   │ │
-│  │  │   │                          │    │           │             │ │   │ │
-│  │  │   │   Root: 20 GB gp3       │    │   Root: 20 GB gp3     │ │   │ │
-│  │  │   └──────────────────────────┘    │           │             │ │   │ │
-│  │  │                                    │   ┌───────▼─────────┐  │ │   │ │
-│  │  │                                    │   │ EBS Data Volume │  │ │   │ │
-│  │  │                                    │   │ 40 GB gp3       │  │ │   │ │
-│  │  │                                    │   │ /var/lib/        │  │ │   │ │
-│  │  │                                    │   │  ruvector/data   │  │ │   │ │
-│  │  │                                    │   └─────────────────┘  │ │   │ │
-│  │  │                                    └─────────────────────────┘ │   │ │
-│  │  │                                                                │   │ │
-│  │  │   ┌─────────────────── VPC Endpoints ──────────────────────┐   │   │ │
-│  │  │   │  • Bedrock Runtime (Interface)                         │   │   │ │
-│  │  │   │  • ECR API + ECR DKR (Interface)                       │   │   │ │
-│  │  │   │  • CloudWatch Logs (Interface)                         │   │   │ │
-│  │  │   │  • S3 (Gateway)                                        │   │   │ │
-│  │  │   │  • SSM + SSM Messages + EC2 Messages (Interface)       │   │   │ │
-│  │  │   └────────────────────────────────────────────────────────┘   │   │ │
-│  │  └────────────────────────────────────────────────────────────────┘   │ │
+│  │  │   ┌──────────────────────────┐     │  │    (ALB AZ-b)       │      │ │
+│  │  │   │   Application Load       │     │  └─────────────────────┘      │ │
+│  │  │   │   Balancer (ALB)         │     │                               │ │
+│  │  │   │   Port 80 → :8000        │     │                               │ │
+│  │  │   │   idle_timeout = 300s    │     │                               │ │
+│  │  │   └──────────┬───────────────┘     │                               │ │
+│  │  │              │ :8000               │                               │ │
+│  │  │   ┌──────────▼───────────────┐    ┌─────────────────────────┐     │ │
+│  │  │   │   RAG App EC2 (Spot)     │    │   Qdrant EC2 (On-Demand)│     │ │
+│  │  │   │   t3.medium              │    │   t3.medium             │     │ │
+│  │  │   │   --network host         │    │                         │     │ │
+│  │  │   │                          │    │   ┌─────────────────┐   │     │ │
+│  │  │   │   ┌──────────────────┐   │    │   │ qdrant:v1.9.2   │   │     │ │
+│  │  │   │   │ rag-chatbot      │───┼────┼──▶│ Port 6333 REST  │   │     │ │
+│  │  │   │   │ FastAPI :8000    │   │    │   │ Port 6334 gRPC  │   │     │ │
+│  │  │   │   └──────────────────┘   │    │   └────────┬────────┘   │     │ │
+│  │  │   │                          │    │            │            │     │ │
+│  │  │   │   Root: 20 GB gp3        │    │   Root: 20 GB gp3      │     │ │
+│  │  │   └──────────────────────────┘    │            │            │     │ │
+│  │  │                                    │   ┌────────▼────────┐  │     │ │
+│  │  │                                    │   │ EBS 40 GB gp3   │  │     │ │
+│  │  │                                    │   │ /var/lib/qdrant/ │  │     │ │
+│  │  │                                    │   │ storage          │  │     │ │
+│  │  │                                    │   └─────────────────┘  │     │ │
+│  │  │                                    └─────────────────────────┘     │ │
+│  │  │                                                                     │ │
+│  │  │   ┌─────────────────── VPC Endpoints (public subnet) ───────────┐  │ │
+│  │  │   │  • bedrock-runtime (Interface) — Titan + Claude calls       │  │ │
+│  │  │   │  • ecr.api + ecr.dkr (Interface) — Docker image pulls       │  │ │
+│  │  │   │  • s3 (Gateway, free) — ECR layer storage                   │  │ │
+│  │  │   │  • ssm + ssmmessages + ec2messages (Interface) — SSM access │  │ │
+│  │  │   └─────────────────────────────────────────────────────────────┘  │ │
+│  │  └─────────────────────────────────────────────────────────────────────┘ │
 │  └────────────────────────────────────────────────────────────────────────┘ │
 │                                                                             │
 │  ┌─── AWS Managed Services ──────────────────────────────────────────────┐  │
-│  │  • AWS Bedrock (Titan Embed v2 + Claude 3.5 Haiku)                    │  │
-│  │  • Amazon ECR (RAG App Docker image)                                  │  │
-│  │  • CloudWatch Logs (7-day retention, structured logs)                 │  │
-│  │  • AWS Budgets ($50/month alarm)                                      │  │
+│  │  • AWS Bedrock Titan Embed Text v2 (1024-dim embeddings)              │  │
+│  │  • AWS Bedrock Claude Haiku 4.5 (US Cross-Region Inference Profile)   │  │
+│  │  • Amazon Textract (OCR + form key-value extraction for scanned PDFs) │  │
+│  │  • AWS Budgets ($50/month alarm at 80% forecast + 100% actual)        │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -78,37 +75,31 @@ This document describes the complete AWS infrastructure for the RuVector RAG Cha
 ### Subnets
 
 | Subnet | CIDR | Type | AZ | Purpose |
-|--------|------|------|------|---------|
-| Public A | 10.0.1.0/24 | Public | us-east-1a | ALB placement |
+|--------|------|------|----|---------|
+| Public A | 10.0.1.0/24 | Public | us-east-1a | EC2 instances + VPC Endpoints |
 | Public B | 10.0.3.0/24 | Public | us-east-1b | ALB multi-AZ requirement |
-| Private | 10.0.2.0/24 | Private | us-east-1a | EC2 instances + VPC Endpoints |
+| Private | 10.0.2.0/24 | Private | us-east-1a | Reserved (unused) |
 
-### Route Tables
-
-| Route Table | Destination | Target | Purpose |
-|-------------|-------------|--------|---------|
-| Public RT | 0.0.0.0/0 | Internet Gateway | ALB internet access |
-| Private RT | 10.0.0.0/16 | local | VPC internal routing |
-| Private RT | S3 prefix list | S3 Gateway Endpoint | ECR image layer pulls |
-
-**No NAT Gateway** — All AWS service access from the private subnet goes through VPC Interface Endpoints. This saves ~$32/month.
+**Both EC2 instances are in the public subnet** with public IPs and internet access via the Internet Gateway. This is required for `git clone` and `docker pull` during bootstrap. VPC endpoints are also in the public subnet so instances can reach AWS services via the AWS backbone.
 
 ### Security Groups
 
 ```
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   ALB SG        │     │  RAG App SG     │     │  RuVector SG    │
+│   ALB SG        │     │  RAG App SG     │     │  Qdrant SG      │
 │                 │     │                 │     │                 │
 │ IN:  80/tcp     │────▶│ IN:  8000/tcp   │────▶│ IN:  6333/tcp   │
-│      from 0.0.0.0│     │      from ALB SG│     │      from RAG SG│
-│                 │     │      22/tcp     │     │      22/tcp     │
-│ OUT: all        │     │      from admin │     │      from admin │
-│                 │     │                 │     │                 │
-│                 │     │ OUT: all        │     │ OUT: all        │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
+│      0.0.0.0/0  │     │      from ALB SG│     │      from RAG SG│
+│                 │     │      22/tcp     │     │      6333/tcp   │
+│ OUT: all        │     │      admin CIDR │     │      admin CIDR │
+│                 │     │                 │     │      22/tcp     │
+│                 │     │ OUT: all        │     │      admin CIDR │
+└─────────────────┘     └─────────────────┘     │                 │
+                                                 │ OUT: all        │
+                                                 └─────────────────┘
 ```
 
-**Traffic isolation:** RuVector only accepts connections from the RAG App security group on port 6333. No public IP, no internet route. The vector database is completely private.
+Port 6333 is open to `admin_ip_cidr` on the Qdrant SG for direct debugging (`curl http://<qdrant-ip>:6333/healthz`).
 
 ---
 
@@ -121,167 +112,102 @@ This document describes the complete AWS infrastructure for the RuVector RAG Cha
 | Instance Type | t3.medium (2 vCPU, 4 GB RAM) |
 | Pricing Model | Spot (persistent, stop on interruption) |
 | AMI | Ubuntu 22.04 amd64 |
+| Subnet | Public (10.0.1.0/24) |
+| Public IP | Yes (for bootstrap internet access) |
 | Root Volume | 20 GB gp3 |
-| Subnet | Private (10.0.2.0/24) |
-| IAM Role | Bedrock + CloudWatch + ECR + SSM |
-| Container | `rag-chatbot` (built from Dockerfile) |
-| Exposed Port | 8000 (to ALB only) |
+| Docker Network | `--network host` (required for IMDS IAM credential access) |
+| IAM Role | Bedrock + Textract + ECR + SSM |
+| Container | `rag-chatbot` (built from Dockerfile at boot) |
+| Exposed Port | 8000 (to ALB SG only) |
 
-**Why Spot?** The RAG App is stateless. If a Spot interruption occurs, the instance stops and the ALB routes traffic away. When a new Spot instance launches, it bootstraps automatically via user_data and re-registers with the target group.
+**Why `--network host`?** The container needs to reach `169.254.169.254` (EC2 Instance Metadata Service) to get IAM role credentials for Bedrock and Textract. Bridge networking blocks this address.
 
-### RuVector Instance (On-Demand)
+### Qdrant Instance (On-Demand)
 
 | Property | Value |
 |----------|-------|
 | Instance Type | t3.medium (2 vCPU, 4 GB RAM) |
 | Pricing Model | On-Demand (protected from interruption) |
 | AMI | Ubuntu 22.04 amd64 |
+| Subnet | Public (10.0.1.0/24) |
+| Public IP | Yes (for docker pull qdrant/qdrant) |
 | Root Volume | 20 GB gp3 |
-| Data Volume | 40 GB gp3 (separate EBS, `delete_on_termination = false`) |
-| Subnet | Private (10.0.2.0/24) |
-| IAM Role | CloudWatch + SSM |
-| Container | `ruvnet/ruvector:latest` |
-| Exposed Port | 6333 (to RAG App SG only) |
+| Data Volume | 40 GB gp3 (separate EBS, mounted at /var/lib/qdrant/storage) |
+| IAM Role | ECR + SSM |
+| Container | `qdrant/qdrant:v1.9.2` |
+| Exposed Ports | 6333 REST, 6334 gRPC |
 
-**Why On-Demand?** RuVector holds persistent vector data. Spot interruptions would risk data corruption during write operations.
+**Why On-Demand?** Qdrant holds persistent vector data. Spot interruptions risk data corruption during write operations.
 
 ---
 
-## VPC Endpoints (NAT Gateway Replacement)
+## VPC Endpoints
 
-Instead of a $32+/month NAT Gateway, we use VPC Interface Endpoints for private AWS service access:
+Interface endpoints keep AWS API calls inside the AWS network (lower latency, no internet data transfer charges). All endpoints are in the public subnet to match the EC2 instances.
 
 | Endpoint | Service | Type | Purpose |
 |----------|---------|------|---------|
-| Bedrock Runtime | `bedrock-runtime` | Interface | Embedding + LLM API calls |
-| ECR API | `ecr.api` | Interface | Docker image metadata |
-| ECR DKR | `ecr.dkr` | Interface | Docker image layer pulls |
-| CloudWatch Logs | `logs` | Interface | Structured log delivery |
-| S3 | `s3` | Gateway (free) | ECR image layer storage |
-| SSM | `ssm` | Interface | Systems Manager access |
-| SSM Messages | `ssmmessages` | Interface | Session Manager connections |
-| EC2 Messages | `ec2messages` | Interface | Instance metadata |
+| bedrock-runtime | `bedrock-runtime` | Interface | Titan embeddings + Claude LLM |
+| ecr.api | `ecr.api` | Interface | Docker image metadata |
+| ecr.dkr | `ecr.dkr` | Interface | Docker image layer pulls |
+| s3 | `s3` | Gateway (free) | ECR image layer storage |
+| ssm | `ssm` | Interface | Systems Manager core |
+| ssmmessages | `ssmmessages` | Interface | Session Manager shell |
+| ec2messages | `ec2messages` | Interface | SSM agent communication |
 
-**Cost:** Interface endpoints cost ~$0.01/hour each + data transfer. For a low-traffic POC, this is significantly cheaper than NAT Gateway ($0.045/hour + $0.045/GB).
+**`depends_on`** is set on all Interface endpoints pointing to the VPC endpoint SG. This ensures Terraform destroys endpoints before the SG on `terraform destroy`, preventing `DependencyViolation` errors.
 
 ---
 
-## Load Balancer Configuration
+## Load Balancer
 
 | Property | Value |
 |----------|-------|
 | Type | Application Load Balancer (Layer 7) |
 | Scheme | Internet-facing |
-| Subnets | Public A + Public B (multi-AZ required) |
+| Subnets | Public A (10.0.1.0/24) + Public B (10.0.3.0/24) |
+| Idle Timeout | **300 seconds** (raised from default 60s to handle large document ingestion) |
 | Listener | HTTP:80 → Forward to RAG App TG |
 | Target Group | RAG App on port 8000 |
 | Health Check | GET /health every 30s, timeout 5s |
 | Healthy Threshold | 2 consecutive successes |
 | Unhealthy Threshold | 3 consecutive failures |
 
-**Failover behavior:** If the RAG App Spot instance is interrupted, the ALB detects unhealthy status within 90 seconds (3 × 30s interval) and stops routing traffic. When the replacement Spot instance bootstraps and passes 2 health checks, traffic resumes.
+The 300s idle timeout is required because document ingestion (PDF parsing + Bedrock embedding calls) can take several minutes for large files. The frontend uses async polling (`/ingest/status/{job_id}`) so the HTTP connection is released immediately after upload.
 
 ---
 
-## Storage Architecture
+## Storage
 
-### EBS Volume Strategy
+| Volume | Attached To | Size | Type | IOPS | Delete on Termination |
+|--------|-------------|------|------|------|-----------------------|
+| RAG App Root | RAG App EC2 | 20 GB | gp3 | default | Yes |
+| Qdrant Root | Qdrant EC2 | 20 GB | gp3 | default | Yes |
+| Qdrant Data | Qdrant EC2 | 40 GB | gp3 | 3000 | **No** |
 
-| Volume | Attached To | Size | Type | Delete on Termination |
-|--------|-------------|------|------|-----------------------|
-| RAG App Root | RAG App EC2 | 20 GB | gp3 | Yes |
-| RuVector Root | RuVector EC2 | 20 GB | gp3 | Yes |
-| RuVector Data | RuVector EC2 | 40 GB | gp3 | **No** |
-
-The RuVector data volume is protected:
-- `delete_on_termination = false` — survives instance termination
-- Mounted at `/var/lib/ruvector/data` inside the container
-- Formatted as ext4 on first use, preserved on subsequent boots
-- Contains all vector collections and HNSW index data
+The Qdrant data volume is mounted at `/var/lib/qdrant/storage` inside the container. The `ruvector.sh` bootstrap script detects the device name (xvdf, nvme1n1, or sdf), formats it with ext4 on first use, and persists the mount in `/etc/fstab`.
 
 ---
 
 ## IAM Architecture
 
-### RAG App Role Permissions
+### RAG App Role (`ruvector-rag-app-role`)
 
 ```
 ruvector-rag-app-role
-├── AmazonSSMManagedInstanceCore     (Systems Manager access)
-├── ruvector-rag-bedrock-policy      (bedrock:InvokeModel, bedrock:ListFoundationModels)
-├── ruvector-rag-cloudwatch-policy   (logs:CreateLogStream, logs:PutLogEvents, ...)
-└── ruvector-rag-ecr-policy          (ecr:GetAuthorizationToken, ecr:BatchGetImage, ...)
+├── AmazonSSMManagedInstanceCore        (Session Manager shell access)
+├── ruvector-rag-bedrock-policy         (bedrock:InvokeModel, bedrock:ListFoundationModels)
+├── ruvector-rag-textract-policy        (textract:DetectDocumentText, textract:AnalyzeDocument)
+└── ruvector-rag-ecr-policy             (ecr:GetAuthorizationToken, ecr:BatchGetImage, ...)
 ```
 
-### RuVector Role Permissions
+### Qdrant Role (`ruvector-ruvector-role`)
 
 ```
 ruvector-ruvector-role
-├── AmazonSSMManagedInstanceCore     (Systems Manager access)
-└── ruvector-rag-cloudwatch-policy   (logs:CreateLogStream, logs:PutLogEvents, ...)
+├── AmazonSSMManagedInstanceCore        (Session Manager shell access)
+└── ruvector-rag-ecr-policy             (ecr:GetAuthorizationToken, ecr:BatchGetImage, ...)
 ```
-
-**Principle of least privilege:** RuVector has no Bedrock or ECR access — it only needs CloudWatch for logging and SSM for remote management.
-
----
-
-## Observability
-
-### CloudWatch Log Groups
-
-| Log Group | Source | Retention |
-|-----------|--------|-----------|
-| `/ruvector-rag/rag-app` | RAG App application logs + user-data bootstrap | 7 days |
-| `/ruvector-rag/ruvector` | RuVector container stdout/stderr + user-data | 7 days |
-
-### Log Format (CloudWatch Insights Compatible)
-
-```
-2024-11-15T14:32:01 service=rag-app level=INFO request_id=a1b2c3d4 Query: 'What was Q3 revenue?' collection=finance_docs
-2024-11-15T14:32:02 service=rag-app level=WARNING request_id=a1b2c3d4 Context gate: RRF score 0.008 below threshold, skipping LLM
-```
-
-**Queryable fields:** service, level, request_id, timestamp
-
-### CloudWatch Insights Example Queries
-
-```sql
--- Find all errors in the last hour
-fields @timestamp, @message
-| filter level = "ERROR"
-| sort @timestamp desc
-| limit 50
-
--- Track Bedrock call latency
-fields @timestamp, @message
-| filter @message like /elapsed_ms/
-| stats avg(elapsed_ms) by bin(5m)
-
--- Find blocked queries
-fields @timestamp, @message
-| filter @message like /guardrail blocked/
-| sort @timestamp desc
-```
-
----
-
-## Cost Breakdown (Estimated Monthly)
-
-| Resource | Pricing | Estimated Cost |
-|----------|---------|----------------|
-| RAG App EC2 (t3.medium Spot) | ~$0.013/hr × 730hr | ~$9.50 |
-| RuVector EC2 (t3.medium On-Demand) | ~$0.0416/hr × 730hr | ~$30.37 |
-| EBS Volumes (80 GB gp3 total) | $0.08/GB/month | ~$6.40 |
-| ALB | $0.0225/hr + LCU | ~$16.43 |
-| VPC Endpoints (7 Interface) | $0.01/hr each | ~$50.40 |
-| CloudWatch Logs | $0.50/GB ingested | ~$0.50 |
-| Bedrock (Titan + Haiku) | Per-token | ~$2-5 |
-| **Total (no traffic)** | | **~$50-65** |
-
-**Cost optimization levers:**
-- Reduce VPC endpoints (remove SSM endpoints if not needed): saves ~$21/month
-- Use a single AZ for non-HA POC
-- Context gate prevents unnecessary Bedrock LLM calls (each saved call = ~$0.003)
 
 ---
 
@@ -292,42 +218,55 @@ terraform apply
     │
     ├─1─▶ VPC + Subnets + IGW + Route Tables
     ├─2─▶ Security Groups
-    ├─3─▶ IAM Roles + Instance Profiles
-    ├─4─▶ VPC Endpoints
-    ├─5─▶ CloudWatch Log Groups
-    ├─6─▶ EBS Volume (RuVector data)
-    ├─7─▶ RuVector EC2 (On-Demand)
-    │        └── user_data/ruvector.sh executes:
+    ├─3─▶ IAM Roles + Policies + Instance Profiles
+    ├─4─▶ VPC Endpoints (depends_on SGs)
+    ├─5─▶ EBS Volume (Qdrant data, 40 GB gp3)
+    ├─6─▶ Qdrant EC2 (On-Demand)
+    │        └── user_data/ruvector.sh:
     │            ├── Install Docker
-    │            ├── Wait for EBS attach + mount
-    │            ├── Install CloudWatch Agent
-    │            └── docker run ruvnet/ruvector:latest
-    ├─8─▶ RAG App EC2 (Spot Request)
-    │        └── user_data/rag_app.sh executes:
+    │            ├── Detect + mount EBS (/var/lib/qdrant/storage)
+    │            └── docker run qdrant/qdrant:v1.9.2
+    ├─7─▶ RAG App EC2 (Spot Request)
+    │        └── user_data/rag_app.sh:
     │            ├── Install Docker
-    │            ├── Install CloudWatch Agent
-    │            ├── git clone rag_app
-    │            ├── docker build + docker run
-    │            └── Health check loop
-    ├─9─▶ ALB + Target Group + Listener
-    └─10─▶ Budget Alarm
+    │            ├── Wait for Qdrant /healthz (up to 5 min)
+    │            ├── git clone Kedar-Gaikwad/rag_app
+    │            ├── docker build rag-chatbot
+    │            ├── docker run --network host
+    │            └── Health check + status report
+    ├─8─▶ ALB + Target Group + Listener
+    └─9─▶ Budget Alarm ($50/month)
 ```
 
-**Total provisioning time:** ~8-12 minutes (dominated by EC2 bootstrap and Docker builds)
+**Total provisioning time:** ~8-12 minutes
 
 ---
 
-## Terraform Destroy Behavior
+## Cost Breakdown (Estimated Monthly)
 
-```bash
-terraform destroy
-```
+| Resource | Pricing | Estimated Cost |
+|----------|---------|----------------|
+| RAG App EC2 (t3.medium Spot) | ~$0.013/hr × 730hr | ~$9.50 |
+| Qdrant EC2 (t3.medium On-Demand) | ~$0.0416/hr × 730hr | ~$30.37 |
+| EBS Volumes (80 GB gp3 total) | $0.08/GB/month | ~$6.40 |
+| ALB | $0.0225/hr + LCU | ~$16.43 |
+| VPC Endpoints (7 Interface) | $0.01/hr each | ~$50.40 |
+| Bedrock (Titan + Claude Haiku) | Per-token | ~$2-5 |
+| Textract | $1.50/1000 pages | ~$0-2 |
+| **Total** | | **~$50-70** |
 
-- **Removed:** VPC, subnets, security groups, EC2 instances, ALB, VPC endpoints, IAM roles, log groups, budget
-- **Preserved:** RuVector data EBS volume (due to `delete_on_termination = false`)
+---
 
-To completely clean up including data:
-```bash
-# After terraform destroy, manually delete the orphaned EBS volume
-aws ec2 delete-volume --volume-id vol-xxxxxxxxx
-```
+## Outputs After `terraform apply`
+
+| Output | Description |
+|--------|-------------|
+| `alb_dns_name` | RAG Chatbot URL: `http://<value>` |
+| `rag_app_instance_id` | Spot instance ID |
+| `rag_app_public_ip` | Public IP for SSH |
+| `ruvector_instance_id` | Qdrant instance ID |
+| `ruvector_public_ip` | Public IP for SSH |
+| `ruvector_private_ip` | Private IP used by RAG App → Qdrant |
+| `ssh_rag_app` | Ready-to-use SSH command |
+| `ssh_ruvector` | Ready-to-use SSH command |
+| `qdrant_health_check` | `curl` command to verify Qdrant |

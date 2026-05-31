@@ -98,6 +98,186 @@ def init_bedrock_client():
 init_bedrock_client()
 
 # ============================================================================
+# TEXTRACT CLIENT - OCR fallback for scanned PDFs
+# ============================================================================
+textract_client = None
+
+def init_textract_client():
+    global textract_client
+    try:
+        boto_config = BotoConfig(
+            region_name=AWS_REGION,
+            read_timeout=60,
+            connect_timeout=5,
+            retries={'max_attempts': 3, 'mode': 'adaptive'}
+        )
+        textract_client = boto3.client("textract", config=boto_config)
+        logger.info("Textract client initialized", extra={'request_id': 'startup'})
+    except Exception as e:
+        logger.warning(f"Failed to initialize Textract client: {e}", extra={'request_id': 'startup'})
+
+init_textract_client()
+
+
+# ============================================================================
+# PDF EXTRACTION - Native text + AcroForm fields + Textract OCR fallback
+# ============================================================================
+
+MIN_TEXT_CHARS_PER_PAGE = 50  # below this we treat the page as scanned/image
+
+
+async def extract_pdf(
+    path: str,
+    filename: str,
+    request_id: str
+) -> tuple:
+    """
+    Three-layer PDF extraction strategy:
+
+    Layer 1 — AcroForm fields (document-level, works for any page):
+        Filled PDF forms store values in /AcroForm. Most reliable for
+        W-9, 1099, tax forms. Extracted once, added as a standalone chunk.
+
+    Layer 2 — pypdf layout extraction (native text PDFs):
+        Uses extraction_mode="layout" for better spatial ordering.
+        If a page yields < MIN_TEXT_CHARS_PER_PAGE it's treated as scanned.
+
+    Layer 3 — Amazon Textract (scanned/image pages):
+        AnalyzeDocument with FORMS+TABLES extracts key-value pairs from
+        form fields. Falls back to DetectDocumentText for plain pages.
+
+    Returns (full_content_string, [(page_num, page_text), ...])
+    """
+    reader = PdfReader(path)
+    page_contents = []
+    full_content = ""
+
+    # --- Layer 1: AcroForm fields (document-level, not page-specific) ---
+    acroform_text = ""
+    try:
+        fields = reader.get_fields()
+        if fields:
+            field_lines = []
+            for field_name, field_obj in fields.items():
+                value = field_obj.get("/V", "")
+                if value and str(value).strip() and str(value) not in ("/Off", "Off"):
+                    clean_name = re.sub(r'\[\d+\]', '', str(field_name)).strip()
+                    field_lines.append(f"{clean_name}: {value}")
+            if field_lines:
+                acroform_text = (
+                    "=== PDF Form Fields (filled values) ===\n"
+                    + "\n".join(field_lines)
+                    + "\n=== End Form Fields ==="
+                )
+                logger.info(
+                    f"AcroForm: {len(field_lines)} filled fields extracted",
+                    extra={'request_id': request_id}
+                )
+    except Exception as e:
+        logger.warning(f"AcroForm extraction failed: {e}", extra={'request_id': request_id})
+
+    # AcroForm data as standalone virtual page 0 — not tied to any specific page
+    if acroform_text:
+        page_contents.append((0, acroform_text))
+        full_content += acroform_text + "\n\n"
+
+    # --- Layer 2 + 3: Per-page extraction ---
+    for i, page in enumerate(reader.pages):
+        page_num = i + 1
+        page_text = ""
+
+        # Try pypdf layout extraction
+        try:
+            page_text = page.extract_text(extraction_mode="layout") or ""
+        except Exception:
+            pass
+        if not page_text or len(page_text.strip()) < MIN_TEXT_CHARS_PER_PAGE:
+            page_text = page.extract_text() or ""
+
+        # Still too little text → scanned page, use Textract
+        if len(page_text.strip()) < MIN_TEXT_CHARS_PER_PAGE:
+            logger.info(
+                f"Page {page_num}: scanned/image detected ({len(page_text.strip())} chars), using Textract",
+                extra={'request_id': request_id}
+            )
+            page_text = await _textract_page(path, page_num, request_id)
+
+        if page_text.strip():
+            page_contents.append((page_num, page_text))
+            full_content += page_text + "\n"
+
+    return full_content, page_contents
+
+
+async def _textract_page(pdf_path: str, page_num: int, request_id: str) -> str:
+    """
+    Send PDF bytes to Textract AnalyzeDocument (FORMS + TABLES).
+    Extracts key-value pairs for form fields plus raw LINE text.
+    Note: Textract sync API processes the whole PDF but we label output with page_num.
+    """
+    if not textract_client:
+        logger.warning("Textract client not available, skipping OCR", extra={'request_id': request_id})
+        return ""
+
+    try:
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        response = textract_client.analyze_document(
+            Document={"Bytes": pdf_bytes},
+            FeatureTypes=["FORMS", "TABLES"]
+        )
+
+        blocks = response.get("Blocks", [])
+        block_map = {b["Id"]: b for b in blocks}
+        lines = []
+        key_value_pairs = {}
+
+        # Extract KEY_VALUE_SET blocks (form field key-value pairs)
+        for block in blocks:
+            if block["BlockType"] == "KEY_VALUE_SET" and "KEY" in block.get("EntityTypes", []):
+                key_text = _get_block_text(block, block_map)
+                value_text = ""
+                for rel in block.get("Relationships", []):
+                    if rel["Type"] == "VALUE":
+                        for val_id in rel["Ids"]:
+                            value_text = _get_block_text(block_map.get(val_id, {}), block_map)
+                if key_text.strip() and value_text.strip():
+                    key_value_pairs[key_text.strip()] = value_text.strip()
+
+        if key_value_pairs:
+            lines.append(f"=== Textract Form Fields (Page {page_num}) ===")
+            for k, v in key_value_pairs.items():
+                lines.append(f"{k}: {v}")
+
+        # Plain LINE blocks for prose
+        for block in blocks:
+            if block["BlockType"] == "LINE":
+                lines.append(block.get("Text", ""))
+
+        result = "\n".join(lines)
+        logger.info(
+            f"Textract page {page_num}: {len(key_value_pairs)} form fields, "
+            f"{sum(1 for b in blocks if b['BlockType'] == 'LINE')} lines",
+            extra={'request_id': request_id}
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"Textract failed for page {page_num}: {e}", extra={'request_id': request_id})
+        return ""
+
+
+def _get_block_text(block: dict, block_map: dict) -> str:
+    """Reconstruct text from a Textract block via its CHILD WORD relationships."""
+    text = ""
+    for rel in block.get("Relationships", []):
+        if rel["Type"] == "CHILD":
+            for child_id in rel["Ids"]:
+                child = block_map.get(child_id, {})
+                if child.get("BlockType") == "WORD":
+                    text += child.get("Text", "") + " "
+    return text.strip()
 # IN-MEMORY STATE
 # ============================================================================
 bm25_indices: Dict[str, SimpleBM25] = {}
@@ -183,17 +363,25 @@ def run_input_guardrail(query: str) -> Optional[str]:
         if re.search(pattern, query, re.IGNORECASE):
             return "Security Notice: Your query has been flagged for attempting prompt override. Please ask standard financial analysis questions."
 
-    financial_keywords = [
+    # Expanded to cover tax forms, legal docs, and general document extraction
+    # in addition to financial report keywords
+    domain_keywords = [
+        # Financial report keywords
         "revenue", "profit", "loss", "ebitda", "cash", "debt", "equity", "asset", "liability",
         "sheet", "statement", "fy", "q1", "q2", "q3", "q4", "finance", "stock", "shares", "growth",
-        "margin", "audit", "tax", "report", "company", "net", "gross", "income", "rate"
+        "margin", "audit", "tax", "report", "company", "net", "gross", "income", "rate",
+        # Document / form extraction keywords
+        "name", "entity", "address", "number", "form", "tin", "ssn", "ein", "social", "security",
+        "identification", "taxpayer", "certification", "signature", "date", "business", "owner",
+        "classification", "withholding", "fatca", "exempt", "payee", "w-9", "w9", "1099",
+        "extract", "what", "who", "which", "show", "find", "get", "list", "tell"
     ]
 
     query_words = re.findall(r'\b[a-z]{3,}\b', query.lower())
     if len(query_words) > 3:
-        matches = [word for word in query_words if word in financial_keywords]
+        matches = [word for word in query_words if word in domain_keywords]
         if not matches:
-            return "Domain Guardrail: I am specialized in corporate and financial documents. Please ask a question related to financial reports."
+            return "Domain Guardrail: I am specialized in corporate and financial documents. Please ask a question related to financial reports or document data."
 
     return None
 
@@ -342,6 +530,66 @@ async def health_bedrock():
         raise HTTPException(status_code=503, detail=f"Bedrock embedding failed: {e}")
 
 
+@app.post("/debug/extract")
+async def debug_extract(file: UploadFile = File(...)):
+    """
+    Debug endpoint: shows exactly what each extraction layer produces.
+    - acroform_fields: values from PDF form fields (Layer 1)
+    - pages: pypdf plain + layout text per page (Layer 2)
+    - textract_page1: Textract output for page 1 (Layer 3, only if page 1 looks scanned)
+    POST the PDF to diagnose why values aren't being retrieved.
+    """
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    raw = await file.read()
+    tmp.write(raw)
+    tmp.close()
+    try:
+        reader = PdfReader(tmp.name)
+
+        # Layer 1: AcroForm
+        acroform_fields = {}
+        try:
+            fields = reader.get_fields()
+            if fields:
+                for field_name, field_obj in fields.items():
+                    value = field_obj.get("/V", "")
+                    acroform_fields[str(field_name)] = str(value) if value else ""
+        except Exception as e:
+            acroform_fields = {"error": str(e)}
+
+        # Layer 2: pypdf per page
+        pages = []
+        for i, page in enumerate(reader.pages):
+            try:
+                layout_text = page.extract_text(extraction_mode="layout")
+            except Exception:
+                layout_text = None
+            plain_text = page.extract_text()
+            pages.append({
+                "page": i + 1,
+                "char_count_plain": len(plain_text or ""),
+                "char_count_layout": len(layout_text or ""),
+                "is_likely_scanned": len((plain_text or "").strip()) < MIN_TEXT_CHARS_PER_PAGE,
+                "plain_text_preview": (plain_text or "")[:1500],
+                "layout_text_preview": (layout_text or "")[:1500],
+            })
+
+        # Layer 3: Textract on page 1 if it looks scanned
+        textract_result = None
+        if pages and pages[0]["is_likely_scanned"]:
+            textract_result = await _textract_page(tmp.name, 1, "debug")
+
+        return {
+            "filename": file.filename,
+            "total_pages": len(reader.pages),
+            "acroform_fields": acroform_fields,
+            "pages": pages,
+            "textract_page1": textract_result
+        }
+    finally:
+        os.unlink(tmp.name)
+
+
 # ============================================================================
 # DOCUMENT INGESTION - Streaming with progress tracking
 # ============================================================================
@@ -413,17 +661,13 @@ async def _process_ingest(job_id: str, temp_path: str, filename: str, collection
     try:
         # Parse file content
         content = ""
+        page_contents = []  # list of (page_num, text) for form-aware chunking
         try:
             if filename.endswith(".pdf"):
-                reader = PdfReader(temp_path)
-                total_pages = len(reader.pages)
-                ingestion_jobs[job_id]["total_pages"] = total_pages
-                for i, page in enumerate(reader.pages):
-                    text = page.extract_text()
-                    if text:
-                        content += text + "\n"
-                    ingestion_jobs[job_id]["processed_pages"] = i + 1
-                    ingestion_jobs[job_id]["progress_pct"] = int(((i + 1) / total_pages) * 40) + 5
+                content, page_contents = await extract_pdf(temp_path, filename, request_id)
+                ingestion_jobs[job_id]["total_pages"] = len(page_contents)
+                ingestion_jobs[job_id]["processed_pages"] = len(page_contents)
+                ingestion_jobs[job_id]["progress_pct"] = 45
             elif filename.endswith((".xlsx", ".xls")):
                 df_dict = pd.read_excel(temp_path, sheet_name=None)
                 total_sheets = len(df_dict)
@@ -458,9 +702,9 @@ async def _process_ingest(job_id: str, temp_path: str, filename: str, collection
             ingestion_jobs[job_id]["error"] = "Document content is empty"
             return
 
-        # Chunking
+        # Chunking — pass page_contents for form-aware per-page chunking
         chunker = SmartFinancialChunker(chunk_size=700, overlap=120)
-        chunks = chunker.chunk_document(content, filename)
+        chunks = chunker.chunk_document(content, filename, page_contents=page_contents)
         logger.info(f"Generated {len(chunks)} chunks", extra={'request_id': request_id})
         ingestion_jobs[job_id]["progress_pct"] = 55
 
@@ -663,7 +907,7 @@ async def chat(query: ChatQuery):
     # LLM Generation
     contexts = [c["text"] for c in top_chunks]
 
-    if LLM_PROVIDER == "bedrock" and bedrock_client:
+    if LLM_PROVIDER == "bedrock" and bedrock_runtime_client:
         raw_response = call_bedrock_haiku(message, contexts)
     else:
         raw_response = (
@@ -715,17 +959,24 @@ async def clear_collection(collection: str = Form("finance_docs")):
             bm25_indices[collection] = SimpleBM25()
 
         dim = get_vector_dimension()
-        async with httpx.AsyncClient() as client:
-            # Delete then recreate with correct Qdrant API
-            await client.delete(f"{RUVECTOR_URL}/collections/{collection}", timeout=5.0)
+
+        # Use separate client instances — reusing one client after DELETE causes
+        # "All connection attempts failed" on the subsequent PUT
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            del_resp = await client.delete(f"{RUVECTOR_URL}/collections/{collection}")
+            if del_resp.status_code not in (200, 404):
+                logger.warning(f"Collection delete returned {del_resp.status_code}: {del_resp.text}",
+                               extra={'request_id': 'clear'})
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.put(
                 f"{RUVECTOR_URL}/collections/{collection}",
-                json={"vectors": {"size": dim, "distance": "Cosine"}},
-                timeout=5.0
+                json={"vectors": {"size": dim, "distance": "Cosine"}}
             )
             if r.status_code not in (200, 201):
-                raise Exception(f"Recreate failed: {r.text}")
-            return {"status": "success", "message": f"Collection '{collection}' cleared."}
+                raise Exception(f"Recreate failed ({r.status_code}): {r.text}")
+
+        return {"status": "success", "message": f"Collection '{collection}' cleared."}
     except Exception as e:
         logger.error(f"Failed to clear collection: {e}", extra={'request_id': 'clear'})
         raise HTTPException(status_code=500, detail=f"Failed to clear collection: {e}")

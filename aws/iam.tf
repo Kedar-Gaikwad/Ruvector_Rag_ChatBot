@@ -55,6 +55,31 @@ resource "aws_iam_role_policy_attachment" "rag_app_bedrock" {
   policy_arn = aws_iam_policy.bedrock_access.arn
 }
 
+# Textract - OCR for scanned PDFs and form key-value extraction
+resource "aws_iam_policy" "textract_access" {
+  name        = "ruvector-rag-textract-policy"
+  description = "Allows RAG app to extract text and form fields from scanned PDFs via Textract"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "textract:DetectDocumentText",
+          "textract:AnalyzeDocument"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "rag_app_textract" {
+  role       = aws_iam_role.rag_app.name
+  policy_arn = aws_iam_policy.textract_access.arn
+}
+
 # ECR - pull qdrant and rag-chatbot images
 resource "aws_iam_policy" "ecr_access" {
   name        = "ruvector-rag-ecr-policy"
