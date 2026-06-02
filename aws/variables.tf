@@ -46,7 +46,7 @@ variable "llm_provider" {
 
 variable "budget_alert_email" {
   type        = string
-  default     = "admin@example.com"
+  default     = "kedar.gaikwad.kg@gmail.com"
   description = "Email address for AWS Budget alerts"
 }
 
